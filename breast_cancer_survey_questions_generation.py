@@ -1,8 +1,8 @@
-
+# app.py
 import json
 import re
 from pathlib import Path
-from typing import List, Dict, Iterable, Optional
+from typing import List, Dict, Optional
 from urllib.parse import urlparse
 
 import numpy as np
@@ -483,29 +483,60 @@ def build_polls_for_article(headline: str, url: str, content: str) -> List[str]:
     return all_polls, facts
 
 # =========================
-# FILE INPUTS
+# FILE INPUTS (repo root only)
 # =========================
 st.header("📰 Breast Cancer News → 🗳️ Poll Generator")
 
+# 1) Upload
 uploaded = st.file_uploader("Upload JSON (list of objects with 'headline','url','content')", type=["json"])
-path_input = st.text_input(
-    "…or enter a local JSON file path",
-    value=r"C:\Users\rajas\OneDrive\Desktop\GRE\Documents\ASU\Semester_4\Capstone\twitter_polls_generated_v3.json"
-)
+
+# 2) Discover JSON files in the repo root only
+APP_DIR = Path(__file__).parent.resolve()
+repo_files: List[Path] = sorted([p for p in APP_DIR.glob("*.json") if p.is_file()])
+repo_choices = ["(none)"] + [p.name for p in repo_files]
+repo_pick = st.selectbox("…or pick a JSON file from this repo (root)", options=repo_choices, index=0)
+
+# 3) Manual path (optional)
+path_input = st.text_input("…or enter a JSON file path (relative to repo root or absolute)", value="")
+
 run_btn = st.button("Generate Polls", type="primary")
+
+def load_json_any(source_file: Path) -> List[Dict]:
+    data = json.loads(source_file.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("Input JSON must be a list of article dicts.")
+    return data
 
 articles: List[Dict] = []
 if run_btn:
     try:
         if uploaded is not None:
             articles = json.load(uploaded)
-        else:
+        elif repo_pick != "(none)":
+            chosen = APP_DIR / repo_pick
+            articles = load_json_any(chosen)
+        elif path_input.strip():
             p = Path(path_input)
+            if not p.is_absolute():
+                p = APP_DIR / p  # treat as relative to repo root
             if not p.exists():
-                st.error("No file provided. Upload a JSON or enter a valid path.")
+                st.error(f"Path not found: {p}")
             else:
-                articles = json.loads(p.read_text(encoding="utf-8"))
-        if not isinstance(articles, list):
+                articles = load_json_any(p)
+        else:
+            # Try a couple of common names in repo root
+            guesses = [
+                APP_DIR / "twitter_polls_generated_v3.json",
+                APP_DIR / "breast_cancer_news_content.json",
+            ]
+            for g in guesses:
+                if g.exists():
+                    articles = load_json_any(g)
+                    st.info(f"Using default file: {g.name}")
+                    break
+            if not articles:
+                st.error("No input provided. Upload a file, pick one from the repo root, or enter a valid path.")
+        if articles and not isinstance(articles, list):
             st.error("Input JSON must be a list of article dicts.")
             articles = []
     except Exception as e:
@@ -526,10 +557,8 @@ if run_btn and articles:
             results.append({"headline": headline, "url": url, "polls": polls})
 
             with st.expander(f"#{idx}  {headline or '(no headline)'}", expanded=False):
-                # Header with clickable url
                 if url:
                     st.markdown(f"**Source:** [{url}]({url})")
-                # show quick facts
                 col1, col2, col3 = st.columns([1.2, 1, 1])
                 with col1:
                     st.markdown("**Indication:** " + (facts["indication"] or "—"))
@@ -541,20 +570,16 @@ if run_btn and articles:
                 with col3:
                     ts = [k for k, v in facts["topics"].items() if v]
                     st.markdown("**Topics:** " + (", ".join(ts) if ts else "—"))
-
-                # content preview
                 if content:
                     preview = content.strip()
                     if len(preview) > 600:
                         preview = preview[:600] + "…"
                     st.markdown("> " + preview.replace("\n", " "))
-
                 st.markdown("---")
                 st.subheader("Generated Polls")
                 if not polls:
                     st.info("No grounded polls were generated for this article.")
                 else:
-                    # render each poll with options as radios (display only)
                     for i, poll in enumerate(polls, start=1):
                         lines = [ln for ln in poll.splitlines() if ln.strip()]
                         if not lines:
@@ -563,13 +588,9 @@ if run_btn and articles:
                         opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
                         with st.container():
                             st.markdown(f"**Q{i}. {q}**")
-                            # display as a disabled radio for visual grouping
-                            st.radio(
-                                label=" ", options=opts or ["(no options)"], index=None, key=f"{idx}-{i}", disabled=True
-                            )
+                            st.radio(label=" ", options=opts or ["(no options)"], index=None, key=f"{idx}-{i}", disabled=True)
                         st.markdown("")
 
-    # download
     st.markdown("---")
     st.subheader("⬇️ Download")
     out_json = json.dumps(results, ensure_ascii=False, indent=2)
@@ -580,10 +601,8 @@ if run_btn and articles:
         mime="application/json"
     )
 
-# Helpful footer
 st.markdown("---")
 st.caption(
     "Tip: If polls look too generic, increase passes or switch to the larger model. "
-    "This app enforces that each question mentions at least one extracted fact (drug/company/indication/phase/topic)."
+    "Each question must mention at least one extracted fact (drug/company/indication/phase/topic)."
 )
-
