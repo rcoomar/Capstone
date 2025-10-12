@@ -1,4 +1,4 @@
-# app.py
+
 import json
 import re
 from pathlib import Path
@@ -586,3 +586,4 @@ st.caption(
     "Tip: If polls look too generic, increase passes or switch to the larger model. "
     "This app enforces that each question mentions at least one extracted fact (drug/company/indication/phase/topic)."
 )
+
