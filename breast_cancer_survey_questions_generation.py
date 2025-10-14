@@ -1,5 +1,6 @@
 # app.py
 import json
+import os
 import re
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -7,24 +8,44 @@ from urllib.parse import urlparse
 
 import numpy as np
 import streamlit as st
+
+# HF / Transformers
+from huggingface_hub import login, InferenceClient
 from transformers import pipeline, AutoTokenizer
+import torch
+
 from sentence_transformers import SentenceTransformer, util
 
 # =========================
-# DEFAULTS - USING MISTRAL MODEL
+# DEFAULTS
 # =========================
 DEFAULT_MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.2"
 MAX_NEW_TOKENS = 200
 MAX_TWEET_CHARS = 280
 MAX_POLL_OPTIONS = 4
 
-# =========================
-# UI SIDEBAR - UPDATED WITH MISTRAL
-# =========================
 st.set_page_config(page_title="Breast Cancer News → Poll Generator", layout="wide")
 
+# =========================
+# SIDEBAR / SETTINGS
+# =========================
 with st.sidebar:
     st.title("⚙️ Settings")
+
+    # Token from secrets or UI
+    default_token = st.secrets.get("HF_TOKEN", "")
+    hf_token = st.text_input(
+        "Hugging Face token",
+        value=default_token,
+        type="password",
+        help="Create at https://huggingface.co/settings/tokens and enable Inference API if you use it."
+    )
+    use_hf_inference = st.toggle(
+        "Use HF Inference API for Mistral (recommended)",
+        value=True,
+        help="If ON, Mistral runs via Hugging Face Inference API using your token. If OFF, it attempts local loading."
+    )
+
     model_name = st.selectbox(
         "LLM Model:",
         [
@@ -33,57 +54,77 @@ with st.sidebar:
             "google/flan-t5-large",
         ],
         index=0,
-        help="Mistral-7B for better quality, Flan-T5 for faster generation"
+        help="Use Inference API for Mistral unless you have a big GPU."
     )
-    
+
     passes_per_article = st.slider("Generation passes per article", 1, 6, 3)
     temperature = st.slider("Temperature (creativity)", 0.0, 1.2, 0.8, 0.1)
     top_p = st.slider("Top-p (nucleus sampling)", 0.1, 1.0, 0.9, 0.05)
-    similarity_dup_threshold = st.slider("Semantic de-dup threshold", 0.80, 0.99, 0.90, 0.01,
-                                         help="Higher = keep only more distinct polls")
+    similarity_dup_threshold = st.slider(
+        "Semantic de-dup threshold", 0.80, 0.99, 0.90, 0.01,
+        help="Higher = keep only more distinct polls"
+    )
     st.markdown("---")
     st.caption("Upload a JSON list like: `[{'headline','url','content'}, ...]`")
 
-# =========================
-# CACHING HEAVY OBJECTS - UPDATED FOR MISTRAL
-# =========================
-@st.cache_resource(show_spinner=False)
-def get_text_generation_pipeline(_model_name: str):
-    """Get appropriate pipeline with fallback handling"""
+# If token entered, log in (safe to run multiple times; it’s idempotent)
+if hf_token:
     try:
-        if "mistral" in _model_name.lower():
-            # Use text-generation for Mistral
-            st.info(f"🔄 Loading Mistral model... This may take a few minutes.")
-            return pipeline(
-                "text-generation",
-                model=_model_name,
-                tokenizer=AutoTokenizer.from_pretrained(_model_name),
-                device_map="auto",
-                torch_dtype="auto",
-                trust_remote_code=True
-            )
-        else:
-            # Text-to-text for Flan models
-            return pipeline(
-                "text2text-generation",
-                model=_model_name,
-                device_map="auto"
-            )
+        login(token=hf_token)
+        os.environ["HUGGINGFACEHUB_API_TOKEN"] = hf_token  # for libs that read env only
     except Exception as e:
-        st.error(f"❌ Failed to load {_model_name}: {str(e)}")
-        st.warning("🔄 Falling back to google/flan-t5-base")
-        return pipeline(
-            "text2text-generation", 
-            model="google/flan-t5-base", 
-            device_map="auto"
-        )
+        st.warning(f"Could not authenticate to Hugging Face: {e}")
 
+# =========================
+# CACHING HEAVY OBJECTS
+# =========================
 @st.cache_resource(show_spinner=False)
 def get_embedder():
     return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
+@st.cache_resource(show_spinner=False)
+def get_hf_inference_client(model_id: str, token: Optional[str]):
+    if not token:
+        raise RuntimeError("No HF token provided for Inference API.")
+    return InferenceClient(model=model_id, token=token, timeout=90)
+
+@st.cache_resource(show_spinner=False)
+def get_local_pipeline(_model_name: str, token: Optional[str]):
+    """
+    Safer local loading:
+      - Avoid device_map='auto' on CPU-only machines
+      - Only try fp16 if CUDA available
+    """
+    is_mistral = "mistral" in _model_name.lower()
+    cuda = torch.cuda.is_available()
+
+    if is_mistral:
+        st.info("🔧 Loading Mistral locally. This requires a large GPU (≥14 GB). "
+                "If you hit OOM, switch to the HF Inference API in the sidebar.")
+        # Mistral is a causal LM
+        dtype = torch.float16 if cuda else torch.float32
+        tok = AutoTokenizer.from_pretrained(_model_name, token=token, trust_remote_code=True)
+        pipe = pipeline(
+            task="text-generation",
+            model=_model_name,
+            tokenizer=tok,
+            torch_dtype=dtype,
+            device=0 if cuda else -1,
+            trust_remote_code=True
+        )
+        return pipe, True
+
+    # Flan models: text2text
+    pipe = pipeline(
+        task="text2text-generation",
+        model=_model_name,
+        tokenizer=AutoTokenizer.from_pretrained(_model_name, token=token),
+        device=0 if torch.cuda.is_available() else -1
+    )
+    return pipe, False
+
 # =========================
-# TEXT HELPERS
+# TEXT HELPERS (unchanged)
 # =========================
 AVOID_PHRASES = [
     r"\bbreakthrough\b", r"\bmiracle\b", r"\bgame[- ]?changing\b",
@@ -173,7 +214,7 @@ def dedup_semantic(blocks: List[str], threshold: float, embedder) -> List[str]:
     return keep
 
 # =========================
-# ENTITY/FACT EXTRACTION
+# ENTITY/FACT EXTRACTION (unchanged)
 # =========================
 KNOWN_PHARMA = {
     "Genentech","Roche","Novartis","Pfizer","AstraZeneca","Eli Lilly","Merck",
@@ -287,7 +328,7 @@ def extract_facts(headline: str, content: str, url: str) -> Dict:
     )
 
 # =========================
-# AWARENESS THEME & POLL
+# AWARENESS THEME & POLL (unchanged)
 # =========================
 def detect_theme_keyphrase(headline: str, content: str, url: str) -> str:
     facts = extract_facts(headline, content, url)
@@ -340,48 +381,56 @@ def detect_theme_keyphrase(headline: str, content: str, url: str) -> str:
     return headline_short
 
 def build_awareness_poll(headline: str, content: str, url: str) -> str:
-    """Updated awareness poll to be more practice-focused"""
     facts = extract_facts(headline, content, url)
     drug, ind = facts["drug"], facts["indication"]
-    
+
     if drug and ind:
         q = f"Q: Were you aware of this {drug} development for {ind} before reading?"
     elif ind:
-        keyphrase = detect_theme_keyphrase(headline, content, url)
         q = f"Q: Were you aware of this {ind} development before reading?"
     else:
-        keyphrase = detect_theme_keyphrase(headline, content, url)
         q = f"Q: Were you aware of this development before reading?"
-    
+
     poll = q + "\n- Yes, was aware\n- No, new information\n- Somewhat aware\n- Will research further"
     poll = enforce_neutrality(poll)
     poll = trim_to_limit(poll, MAX_TWEET_CHARS)
     return poll
 
 # =========================
-# LLM MINER - UPDATED FOR MISTRAL
+# LLM MINER (updated to use HF Inference when selected)
 # =========================
 class PollMiner:
-    def __init__(self, _model_name: str):
+    def __init__(self, _model_name: str, use_inference_api: bool, token: Optional[str]):
+        self.model_name = _model_name
+        self.is_mistral = "mistral" in _model_name.lower()
+        self.use_inference_api = use_inference_api and self.is_mistral
+
+        self.model_loaded = False
+        self.hf_client = None
+        self.gen_pipeline = None
+
         try:
-            self.gen_pipeline = get_text_generation_pipeline(_model_name)
-            self.model_name = _model_name
-            self.is_mistral = "mistral" in _model_name.lower()
-            self.model_loaded = True
+            if self.use_inference_api:
+                self.hf_client = get_hf_inference_client(_model_name, token)
+                self.model_loaded = True
+            else:
+                self.gen_pipeline, is_mistral_local = get_local_pipeline(_model_name, token)
+                self.model_loaded = True
         except Exception as e:
-            st.error(f"Failed to initialize model {_model_name}: {e}")
-            # Fallback to Flan-T5
-            self.gen_pipeline = get_text_generation_pipeline("google/flan-t5-base")
+            st.error(f"❌ Failed to initialize model {_model_name}: {e}")
+            st.warning("🔄 Falling back to google/flan-t5-base locally.")
+            # Fallback local Flan
+            self.gen_pipeline, _ = get_local_pipeline("google/flan-t5-base", token)
             self.model_name = "google/flan-t5-base"
             self.is_mistral = False
-            self.model_loaded = False
+            self.use_inference_api = False
+            self.model_loaded = True
 
     def _format_mistral_prompt(self, headline: str, url: str, content: str, facts: Dict) -> str:
-        """Format prompt specifically for Mistral with practice-focused questions"""
         snippet = content.strip()
         if len(snippet) > 1000:
             snippet = snippet[:1000]
-        
+
         facts_str = json.dumps({
             "drug": facts["drug"],
             "companies": facts["companies"][:3],
@@ -389,7 +438,7 @@ class PollMiner:
             "phase": facts["phase"],
             "topics_true": [k for k,v in facts["topics"].items() if v]
         }, ensure_ascii=False)
-        
+
         prompt = f"""<s>[INST] You are a medical content specialist creating Twitter/X poll questions about breast cancer news.
 
 TASK: Generate practice-focused Twitter/X poll questions that assess how this medical information impacts clinical practice.
@@ -426,7 +475,6 @@ Ensure each question assesses clinical utility and practice impact. [/INST]"""
         return prompt
 
     def _format_flan_prompt(self, headline: str, url: str, content: str, facts: Dict) -> str:
-        """Format prompt for Flan-T5 models"""
         snippet = content.strip()
         if len(snippet) > 1000:
             snippet = snippet[:1000]
@@ -437,7 +485,7 @@ Ensure each question assesses clinical utility and practice impact. [/INST]"""
             "phase": facts["phase"],
             "topics_true": [k for k,v in facts["topics"].items() if v]
         }, ensure_ascii=False)
-        
+
         return f"""Generate practice-focused Twitter/X poll questions assessing clinical utility and practice impact.
 
 FOCUS AREAS:
@@ -471,59 +519,74 @@ Q: <practice-impact question with specific context>
         else:
             return self._format_flan_prompt(headline, url, content, facts)
 
+    def _generate_with_inference_api(self, prompt: str, temperature: float, top_p: float) -> str:
+        """HF Inference API call for text-generation models."""
+        # Use safe defaults compatible with Mistral
+        return self.hf_client.text_generation(
+            prompt,
+            max_new_tokens=MAX_NEW_TOKENS,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=1.05,
+            return_full_text=False,  # only the completion
+            stream=False
+        )
+
     def generate(self, headline: str, url: str, content: str, facts: Dict,
                  passes: int, temperature: float, top_p: float) -> List[str]:
-        if not self.model_loaded:
-            st.warning("Using fallback model (google/flan-t5-base) for generation.")
-        
+
         all_blocks: List[str] = []
-        
         for i in range(passes):
             try:
                 with st.spinner(f"Generating polls (pass {i+1}/{passes})..."):
-                    if self.is_mistral:
-                        # Mistral generation
-                        result = self.gen_pipeline(
-                            self._prompt(headline, url, content, facts),
-                            max_new_tokens=MAX_NEW_TOKENS,
-                            do_sample=True,
-                            temperature=temperature,
-                            top_p=top_p,
-                            num_return_sequences=1,
-                            pad_token_id=self.gen_pipeline.tokenizer.eos_token_id,
-                            return_full_text=False
-                        )
-                        out = result[0]["generated_text"]
+                    prompt = self._prompt(headline, url, content, facts)
+
+                    if self.use_inference_api:
+                        out = self._generate_with_inference_api(prompt, temperature, top_p)
                     else:
-                        # Flan-T5 generation
-                        result = self.gen_pipeline(
-                            self._prompt(headline, url, content, facts),
-                            max_new_tokens=MAX_NEW_TOKENS,
-                            do_sample=True,
-                            temperature=temperature,
-                            top_p=top_p,
-                            num_return_sequences=1,
-                        )
-                        out = result[0]["generated_text"]
-                    
+                        if self.is_mistral:
+                            # causal LM
+                            result = self.gen_pipeline(
+                                prompt,
+                                max_new_tokens=MAX_NEW_TOKENS,
+                                do_sample=True,
+                                temperature=temperature,
+                                top_p=top_p,
+                                num_return_sequences=1,
+                                pad_token_id=self.gen_pipeline.tokenizer.eos_token_id,
+                                return_full_text=False,
+                            )
+                            out = result[0]["generated_text"]
+                        else:
+                            # Flan text2text
+                            result = self.gen_pipeline(
+                                prompt,
+                                max_new_tokens=MAX_NEW_TOKENS,
+                                do_sample=True,
+                                temperature=temperature,
+                                top_p=top_p,
+                                num_return_sequences=1,
+                            )
+                            out = result[0]["generated_text"]
+
                     blocks = parse_polls_block(out)
                     for b in blocks:
                         b = enforce_neutrality(b)
                         b = trim_to_limit(b, MAX_TWEET_CHARS)
                         all_blocks.append(b)
-                        
+
             except Exception as e:
                 st.warning(f"Generation attempt {i+1} failed: {e}")
                 continue
 
-        # Exact dedup
+        # Exact de-dup
         uniq = list(dict.fromkeys([normalize_ws(b) for b in all_blocks]))
-        
-        # Semantic dedup
+
+        # Semantic de-dup
         embedder = get_embedder()
         uniq = dedup_semantic(uniq, similarity_dup_threshold, embedder)
 
-        # Enhanced grounded filter with practice focus
+        # Grounding filter
         grounded_terms = set()
         if facts["drug"]: grounded_terms.add(str(facts["drug"]).lower())
         for c in facts["companies"]:
@@ -536,10 +599,9 @@ Q: <practice-impact question with specific context>
 
         def is_grounded(poll: str) -> bool:
             t = poll.lower()
-            # Check for specific clinical terms AND practice-focused language
             clinical_terms_present = any(term in t for term in grounded_terms)
             practice_focus_present = any(phrase in t for phrase in [
-                "practice", "clinical", "use this", "impact", "change", "inform", 
+                "practice", "clinical", "use this", "impact", "change", "inform",
                 "applicable", "relevant", "approach", "discussion", "treatment"
             ])
             return clinical_terms_present and practice_focus_present
@@ -559,10 +621,9 @@ Q: <practice-impact question with specific context>
         return final
 
 # =========================
-# RULE-BASED FALLBACK - UPDATED FOR PRACTICE FOCUS
+# RULE-BASED FALLBACK (unchanged)
 # =========================
 def rule_based_polls(facts: Dict) -> List[str]:
-    """Generate practice-focused rule-based polls"""
     polls: List[str] = []
     def add(q, options):
         block = "Q: " + q.strip()
@@ -576,7 +637,6 @@ def rule_based_polls(facts: Dict) -> List[str]:
     companies = facts["companies"]
     tp = facts["topics"]
 
-    # Practice-focused questions with specific clinical context
     if drug and ind:
         add(
             f"Is this information about {drug} for {ind} practice-changing for you?",
@@ -586,32 +646,26 @@ def rule_based_polls(facts: Dict) -> List[str]:
             f"Will you use this {drug} information in your {ind} practice?",
             ["Yes, immediately applicable", "Yes, with certain patients", "No, not applicable", "Need guideline updates first"]
         )
-    
     if tp["fda_approval"] and drug:
         add(
             f"How practice-informing is the FDA approval of {drug} for {ind}?",
             ["Highly practice-changing", "Moderately informative", "Minimal impact", "Awaiting real-world data"]
         )
-    
     if tp["trial"] and phase and drug:
         add(
             f"Does this Phase {phase} {drug} trial data impact your clinical approach to {ind}?",
             ["Yes, changes my thinking", "Yes, confirms current approach", "No, not convincing", "Need more follow-up"]
         )
-    
     if tp["endpoints"] and drug:
         add(
             f"How will these {drug} {ind} results influence your treatment discussions?",
             ["Significantly change discussions", "Modestly inform discussions", "No impact on discussions", "Uncertain until published"]
         )
-    
     if companies and drug:
         add(
             f"Is this {drug} development by {companies[0]} practice-relevant for your {ind} patients?",
             ["Yes, highly relevant", "Yes, for some patients", "No, not applicable", "Depends on access/cost"]
         )
-
-    # General practice-focused questions as fallback
     if ind and not polls:
         add(
             f"How practice-changing is this {ind} information?",
@@ -628,8 +682,8 @@ def rule_based_polls(facts: Dict) -> List[str]:
 def build_polls_for_article(headline: str, url: str, content: str) -> List[str]:
     facts = extract_facts(headline, content, url)
     awareness = build_awareness_poll(headline, content, url)
-    
-    miner = PollMiner(model_name)
+
+    miner = PollMiner(model_name, use_hf_inference, hf_token)
     llm_polls = miner.generate(headline, url, content, facts,
                                passes_per_article, temperature, top_p)
     if not llm_polls:
@@ -648,16 +702,13 @@ def build_polls_for_article(headline: str, url: str, content: str) -> List[str]:
 # =========================
 st.header("📰 Breast Cancer News → 🗳️ Poll Generator")
 
-# 1) Upload
 uploaded = st.file_uploader("Upload JSON (list of objects with 'headline','url','content')", type=["json"])
 
-# 2) Discover JSON files in the repo root only
 APP_DIR = Path(__file__).parent.resolve()
 repo_files: List[Path] = sorted([p for p in APP_DIR.glob("*.json") if p.is_file()])
 repo_choices = ["(none)"] + [p.name for p in repo_files]
 repo_pick = st.selectbox("…or pick a JSON file from this repo (root)", options=repo_choices, index=0)
 
-# 3) Manual path (optional)
 path_input = st.text_input("…or enter a JSON file path (relative to repo root or absolute)", value="")
 
 run_btn = st.button("Generate Polls", type="primary")
@@ -679,13 +730,12 @@ if run_btn:
         elif path_input.strip():
             p = Path(path_input)
             if not p.is_absolute():
-                p = APP_DIR / p  # treat as relative to repo root
+                p = APP_DIR / p
             if not p.exists():
                 st.error(f"Path not found: {p}")
             else:
                 articles = load_json_any(p)
         else:
-            # Try a couple of common names in repo root
             guesses = [
                 APP_DIR / "twitter_polls_generated_v3.json",
                 APP_DIR / "breast_cancer_news_content.json",
@@ -709,58 +759,61 @@ if run_btn:
 # =========================
 results = []
 if run_btn and articles:
-    with st.spinner("Generating polls…"):
-        for idx, art in enumerate(articles, start=1):
-            headline = (art.get("headline") or "").strip()
-            url = (art.get("url") or "").strip()
-            content = (art.get("content") or "").strip()
-            polls, facts = build_polls_for_article(headline, url, content)
-            results.append({"headline": headline, "url": url, "polls": polls})
+    if "mistral" in model_name.lower() and use_hf_inference and not hf_token:
+        st.error("You selected the Inference API for Mistral, but no HF token is set.")
+    else:
+        with st.spinner("Generating polls…"):
+            for idx, art in enumerate(articles, start=1):
+                headline = (art.get("headline") or "").strip()
+                url = (art.get("url") or "").strip()
+                content = (art.get("content") or "").strip()
+                polls, facts = build_polls_for_article(headline, url, content)
+                results.append({"headline": headline, "url": url, "polls": polls})
 
-            with st.expander(f"#{idx}  {headline or '(no headline)'}", expanded=False):
-                if url:
-                    st.markdown(f"**Source:** [{url}]({url})")
-                col1, col2, col3 = st.columns([1.2, 1, 1])
-                with col1:
-                    st.markdown("**Indication:** " + (facts["indication"] or "—"))
-                    st.markdown("**Drug:** " + (facts["drug"] or "—"))
-                    st.markdown("**Phase:** " + (facts["phase"] or "—"))
-                with col2:
-                    st.markdown("**Publisher:** " + (facts["publisher"] or "—"))
-                    st.markdown("**Companies:** " + (", ".join(facts["companies"]) or "—"))
-                with col3:
-                    ts = [k for k, v in facts["topics"].items() if v]
-                    st.markdown("**Topics:** " + (", ".join(ts) if ts else "—"))
-                if content:
-                    preview = content.strip()
-                    if len(preview) > 600:
-                        preview = preview[:600] + "…"
-                    st.markdown("> " + preview.replace("\n", " "))
-                st.markdown("---")
-                st.subheader("Generated Polls")
-                if not polls:
-                    st.info("No grounded polls were generated for this article.")
-                else:
-                    for i, poll in enumerate(polls, start=1):
-                        lines = [ln for ln in poll.splitlines() if ln.strip()]
-                        if not lines:
-                            continue
-                        q = lines[0].replace("Q:", "").strip()
-                        opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
-                        with st.container():
-                            st.markdown(f"**Q{i}. {q}**")
-                            st.radio(label=" ", options=opts or ["(no options)"], index=None, key=f"{idx}-{i}", disabled=True)
-                        st.markdown("")
+                with st.expander(f"#{idx}  {headline or '(no headline)'}", expanded=False):
+                    if url:
+                        st.markdown(f"**Source:** [{url}]({url})")
+                    col1, col2, col3 = st.columns([1.2, 1, 1])
+                    with col1:
+                        st.markdown("**Indication:** " + (facts["indication"] or "—"))
+                        st.markdown("**Drug:** " + (facts["drug"] or "—"))
+                        st.markdown("**Phase:** " + (facts["phase"] or "—"))
+                    with col2:
+                        st.markdown("**Publisher:** " + (facts["publisher"] or "—"))
+                        st.markdown("**Companies:** " + (", ".join(facts["companies"]) or "—"))
+                    with col3:
+                        ts = [k for k, v in facts["topics"].items() if v]
+                        st.markdown("**Topics:** " + (", ".join(ts) if ts else "—"))
+                    if content:
+                        preview = content.strip()
+                        if len(preview) > 600:
+                            preview = preview[:600] + "…"
+                        st.markdown("> " + preview.replace("\n", " "))
+                    st.markdown("---")
+                    st.subheader("Generated Polls")
+                    if not polls:
+                        st.info("No grounded polls were generated for this article.")
+                    else:
+                        for i, poll in enumerate(polls, start=1):
+                            lines = [ln for ln in poll.splitlines() if ln.strip()]
+                            if not lines:
+                                continue
+                            q = lines[0].replace("Q:", "").strip()
+                            opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
+                            with st.container():
+                                st.markdown(f"**Q{i}. {q}**")
+                                st.radio(label=" ", options=opts or ["(no options)"], index=None, key=f"{idx}-{i}", disabled=True)
+                            st.markdown("")
 
-    st.markdown("---")
-    st.subheader("⬇️ Download")
-    out_json = json.dumps(results, ensure_ascii=False, indent=2)
-    st.download_button(
-        "Download results as JSON",
-        data=out_json.encode("utf-8"),
-        file_name="twitter_polls_generated.json",
-        mime="application/json"
-    )
+        st.markdown("---")
+        st.subheader("⬇️ Download")
+        out_json = json.dumps(results, ensure_ascii=False, indent=2)
+        st.download_button(
+            "Download results as JSON",
+            data=out_json.encode("utf-8"),
+            file_name="twitter_polls_generated.json",
+            mime="application/json"
+        )
 
 st.markdown("---")
 st.caption(
