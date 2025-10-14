@@ -3,7 +3,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 import numpy as np
@@ -20,6 +20,7 @@ LLAMA_MODEL = "meta-llama/llama-3-3-70b-instruct"      # chat_model on watsonx
 MISTRAL_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"    # optional alt
 MAX_TWEET_CHARS = 280
 MAX_POLL_OPTIONS = 4
+MAX_POLLS_PER_ARTICLE = 4  # <-- hard cap (includes awareness, if present)
 
 st.set_page_config(page_title="Breast Cancer News → Poll Generator", layout="wide")
 
@@ -69,7 +70,7 @@ with st.sidebar:
     )
 
     similarity_dup_threshold = st.slider(
-        "Uniqueness threshold (semantic de-dup)", 0.85, 0.99, 0.94, 0.01,
+        "Uniqueness threshold (semantic de-dup)", 0.85, 0.99, 0.95, 0.01,
         help="Higher = only keep very distinct polls (per article)."
     )
 
@@ -236,7 +237,7 @@ def dedup_semantic(blocks: List[str], threshold: float, embedder) -> List[str]:
     return keep
 
 # =========================
-# ENTITY/FACT EXTRACTION (kept simple)
+# ENTITY/FACT EXTRACTION (simple)
 # =========================
 KNOWN_PHARMA = {
     "Genentech","Roche","Novartis","Pfizer","AstraZeneca","Eli Lilly","Merck",
@@ -318,7 +319,7 @@ def detect_topics(text: str, lower_text: str) -> Dict[str, bool]:
         fda_approval=("fda" in lower_text and re.search(r"\bapprov|\bauthoriz", lower_text)),
         trial=bool(re.search(r"\b(clinical )?trial\b|\bstudy\b", lower_text)),
         acquisition=bool(re.search(r"\bacquisit|acquire|merger\b", lower_text)),
-        partnership=bool(research := re.search(r"\b(partner|collaborat|licens|alliance)\w*\b", lower_text)),
+        partnership=bool(re.search(r"\b(partner|collaborat|licens|alliance)\w*\b", lower_text)),
         endpoints=bool(re.search(r"\bprogression[- ]free survival\b|\bPFS\b|\boverall survival\b|\bOS\b|\bORR\b|\bresponse rate\b", text, flags=re.I)),
         setting_firstline=bool(re.search(r"\bfirst[- ]?line\b", lower_text)),
         setting_adjuvant=bool(re.search(r"\badjuvant\b", lower_text)),
@@ -350,7 +351,7 @@ def extract_facts(headline: str, content: str, url: str) -> Dict:
     )
 
 # =========================
-# AWARENESS POLL (kept)
+# AWARENESS POLL
 # =========================
 def build_awareness_poll(headline: str, content: str, url: str) -> str:
     facts = extract_facts(headline, content, url)
@@ -369,7 +370,7 @@ def build_awareness_poll(headline: str, content: str, url: str) -> str:
     return poll
 
 # =========================
-# LLM MINER (watsonx + HF + local Mistral)
+# LLM MINER
 # =========================
 class PollMiner:
     def __init__(self, _model_name: str, provider: str, use_hf_inference: bool,
@@ -412,7 +413,7 @@ class PollMiner:
             self.gen_pipeline = None
             self.wxa_model = None
 
-    # ---------- HCP-perspective, content-bound prompt ----------
+    # ---------- HCP-perspective, content-bound prompt (max 4 polls) ----------
     def _format_prompt(self, headline: str, url: str, content: str, facts: Dict) -> str:
         snippet = content.strip()
         if len(snippet) > 1600:
@@ -426,22 +427,19 @@ class PollMiner:
         }, ensure_ascii=False)
 
         return f"""
-You are an assistant that writes Twitter/X poll questions to understand a **doctor's (HCP) perspective** on a single breast cancer news article.
+You are an assistant that writes Twitter/X poll questions to understand a **doctor's (HCP) perspective** on ONE breast cancer news article.
 
 STRICT CONTENT RULES — READ CAREFULLY:
 - USE ONLY information that appears in the headline or article content below (or in Key Facts). Do NOT invent drugs, companies, endpoints, biomarkers, or settings.
 - Each poll MUST clearly reference the specific context present in the article (e.g., drug name, indication, phase/setting, relevant endpoint if mentioned).
-- Produce SEVERAL polls that are mutually DISTINCT in focus (e.g., practice-changing vs. practice-informing, endpoint vs. setting, line of therapy vs. biomarker). Avoid paraphrases.
+- Produce AT MOST **4** polls and make them mutually DISTINCT in focus (avoid paraphrases):
+  • practice impact (practice-informing vs practice-changing)  
+  • intent to use in practice  
+  • patient selection / setting (line of therapy, subtype, biomarker)  
+  • endpoints / treatment discussions (e.g., PFS/OS/ORR if mentioned)
 - Keep each poll UNDER 280 characters total (question + options) and include 3–4 concise options.
 - Return COMPLETE polls only (no truncated options).
-- The polls should strictly follow a pattern to learn the **doctor's perspective**: whether this news is practice-informing or practice-changing, whether they will use it in practice, and for which **patient types** this would apply. This agent's goal is NOT general Q&A; it is specifically to elicit HCP practice intent.
-
-Use these HCP-centric question patterns when relevant (adapt wording, do not repeat):
-- "Is this information practice-informing or practice-changing for your [context] patients?"
-- "Will you use this in your clinical practice for [indication/patient subset]?"
-- "For which patients would you consider this (e.g., line of therapy, biomarker, subtype)?"
-- "How will these data affect your treatment discussions (e.g., PFS/OS/ORR if reported)?"
-- "In which setting (adjuvant, first-line, etc.) does this change your approach, if at all?"
+- Purpose: elicit the **doctor's perspective** (practice intent), not generic Q&A.
 
 ARTICLE INFORMATION:
 Headline: "{headline}"
@@ -451,7 +449,7 @@ Key Facts (only for grounding; do not add new facts): {facts_str}
 ARTICLE CONTENT (truncated):
 {snippet}
 
-OUTPUT FORMAT (repeat for several distinct polls; no extra text):
+OUTPUT FORMAT (up to 4 polls; no extra text):
 Q: <HCP-perspective question that strictly reflects article content>
 - Option 1
 - Option 2
@@ -523,15 +521,80 @@ Q: <HCP-perspective question that strictly reflects article content>
             stream=False,
         )
 
-    # --- uniqueness-only filtering ---
+    # --- uniqueness-only filtering + diversity buckets ---
     @staticmethod
     def _stem(line: str) -> str:
         s = line.lower()
         s = re.sub(r"^q\s*:\s*", "", s)
         s = re.sub(r"[^a-z0-9 ]+", " ", s)
-        s = re.sub(r"\b(the|a|an|for|of|to|in|on|with|about|is|are|this|that|how|will)\b", " ", s)
+        s = re.sub(r"\b(the|a|an|for|of|to|in|on|with|about|is|are|this|that|how|will|your|does|do)\b", " ", s)
         s = re.sub(r"\s+", " ", s).strip()
         return s
+
+    @staticmethod
+    def _bucket(q_text: str) -> str:
+        t = q_text.lower()
+        if "aware" in t or "awareness" in t:
+            return "awareness"
+        if ("practice-changing" in t) or ("practice changing" in t) or ("practice-informing" in t) or ("impact" in t):
+            return "practice_impact"
+        if ("will you use" in t) or ("use this" in t) or ("in your practice" in t) or ("consider using" in t):
+            return "intent_to_use"
+        if any(k in t for k in ["which patients", "patient", "line of therapy", "first-line", "adjuvant", "setting", "subtype", "biomarker"]):
+            return "patient_selection"
+        if any(k in t for k in ["pfs", "os", "orr", "endpoint", "discussions"]):
+            return "endpoints"
+        return "other"
+
+    def _select_diverse_top4(self, polls: List[str], embedder) -> List[str]:
+        """Pick at most one per bucket in priority order, max 4 total."""
+        if not polls:
+            return []
+
+        # exact de-dup
+        uniq = list(dict.fromkeys([normalize_ws(p) for p in polls]))
+        # semantic de-dup
+        uniq = dedup_semantic(uniq, similarity_dup_threshold, embedder)
+
+        # stem de-dup within selection loop
+        priority = ["practice_impact", "intent_to_use", "patient_selection", "endpoints", "other"]
+        chosen: List[str] = []
+        seen_stems: List[str] = []
+
+        # bucketize
+        by_bucket: Dict[str, List[str]] = {}
+        for p in uniq:
+            qline = p.splitlines()[0] if p else ""
+            bucket = self._bucket(qline)
+            by_bucket.setdefault(bucket, []).append(p)
+
+        for b in priority:
+            for candidate in by_bucket.get(b, []):
+                stem = self._stem(candidate.splitlines()[0])
+                if not seen_stems:
+                    chosen.append(candidate); seen_stems.append(stem)
+                    break
+                # stem cosine to avoid paraphrases
+                if util.cos_sim(embedder.encode(stem), embedder.encode(seen_stems)).max().item() < 0.90:
+                    chosen.append(candidate); seen_stems.append(stem)
+                    break
+                if len(chosen) >= MAX_POLLS_PER_ARTICLE:
+                    break
+            if len(chosen) >= MAX_POLLS_PER_ARTICLE:
+                break
+
+        # If still under cap, fill with remaining unique (non-paraphrase)
+        if len(chosen) < MAX_POLLS_PER_ARTICLE:
+            for p in uniq:
+                if p in chosen:
+                    continue
+                stem = self._stem(p.splitlines()[0])
+                if util.cos_sim(embedder.encode(stem), embedder.encode(seen_stems)).max().item() < 0.90:
+                    chosen.append(p); seen_stems.append(stem)
+                if len(chosen) >= MAX_POLLS_PER_ARTICLE:
+                    break
+
+        return chosen[:MAX_POLLS_PER_ARTICLE]
 
     def generate(self, headline: str, url: str, content: str, facts: Dict,
                  passes: int, temperature: float, top_p: float, max_new_tokens: int) -> List[str]:
@@ -583,16 +646,9 @@ Q: <HCP-perspective question that strictly reflects article content>
                 st.warning(f"Generation attempt {i+1} failed: {e}")
                 continue
 
-        # 1) Exact de-dup
-        uniq = list(dict.fromkeys([normalize_ws(b) for b in all_blocks]))
-
-        # 2) Semantic de-dup
-        embedder = get_embedder()
-        uniq = dedup_semantic(uniq, similarity_dup_threshold, embedder)
-
-        # 3) Question-stem de-dup
-        final, stems = [], []
-        for blk in uniq:
+        # Keep only polls that look valid
+        valid = []
+        for blk in all_blocks:
             lines = [ln for ln in blk.splitlines() if ln.strip()]
             if not lines or not lines[0].lower().startswith("q"):
                 continue
@@ -601,18 +657,13 @@ Q: <HCP-perspective question that strictly reflects article content>
                 continue
             if len("\n".join(lines)) > MAX_TWEET_CHARS:
                 continue
+            valid.append(blk)
 
-            stem = self._stem(lines[0])
-            if not stems:
-                final.append(blk); stems.append(stem); continue
-
-            if util.cos_sim(embedder.encode(stem), embedder.encode(stems)).max().item() < 0.90:
-                final.append(blk); stems.append(stem)
-
-        return final
+        embedder = get_embedder()
+        return self._select_diverse_top4(valid, embedder)
 
 # =========================
-# RULE-BASED FALLBACK (unchanged)
+# RULE-BASED FALLBACK (kept simple)
 # =========================
 def rule_based_polls(facts: Dict) -> List[str]:
     polls: List[str] = []
@@ -625,37 +676,27 @@ def rule_based_polls(facts: Dict) -> List[str]:
             polls.append(block)
 
     drug, ind, phase = facts["drug"], facts["indication"], facts["phase"]
-    companies = facts["companies"]
     tp = facts["topics"]
 
     if drug and ind:
         add(
             f"Is this information about {drug} for {ind} practice-changing for you?",
-            ["Yes, will change my practice", "Informative but no change", "Not relevant", "Need more data"]
+            ["Practice-changing", "Practice-informing", "No impact", "Need more data"]
         )
         add(
-            f"Will you use this {drug} information in your {ind} practice?",
-            ["Yes, immediately", "Yes, with select patients", "No", "Awaiting guidelines"]
+            f"Will you use {drug} for {ind} in your practice?",
+            ["Yes, broadly", "Yes, select patients", "Not now", "Awaiting guidelines"]
         )
-    if tp["fda_approval"] and drug:
         add(
-            f"How practice-informing is the FDA approval of {drug} for {ind}?",
-            ["Practice-changing", "Informative", "Minimal impact", "Need RWE"]
+            f"For which {ind} patients would you consider {drug}?",
+            ["First-line", "Later-line", "Specific biomarker", "Not applicable"]
         )
-    if tp["trial"] and phase and drug:
         add(
-            f"Does this Phase {phase} {drug} trial impact your approach to {ind}?",
-            ["Changes approach", "Confirms current practice", "No impact", "Need follow-up"]
-        )
-    if ind and not polls:
-        add(
-            f"Is this {ind} information practice-informing?",
-            ["Yes", "Somewhat", "Not really", "Unsure"]
+            f"Do these results change your treatment discussions?",
+            ["Significantly", "Somewhat", "Not really", "Unsure"]
         )
 
-    embedder = get_embedder()
-    polls = dedup_semantic(list(dict.fromkeys(polls)), 0.92, embedder)
-    return polls
+    return polls[:MAX_POLLS_PER_ARTICLE]
 
 # =========================
 # PIPELINE (one article)
@@ -675,26 +716,32 @@ def build_polls_for_article(headline: str, url: str, content: str):
     llm_polls = miner.generate(headline, url, content, facts,
                                passes_per_article, temperature, top_p, max_new_tokens)
 
-    if not llm_polls:
-        if allow_rule_fallback:
-            llm_polls = rule_based_polls(facts)
-        else:
-            raise RuntimeError(
-                "LLM generation failed. Verify credentials/token and provider access, "
-                "or enable rule-based fallback in the sidebar."
-            )
+    if not llm_polls and allow_rule_fallback:
+        llm_polls = rule_based_polls(facts)
 
-    all_polls = [awareness] + llm_polls
-    all_polls = list(dict.fromkeys([normalize_ws(p) for p in all_polls]))
+    # Combine with awareness and cap to MAX_POLLS_PER_ARTICLE with diversity
     embedder = get_embedder()
-    all_polls = dedup_semantic(all_polls, 0.92, embedder)
-    if awareness in all_polls and all_polls[0] != awareness:
-        all_polls.remove(awareness)
-        all_polls.insert(0, awareness)
-    return all_polls, facts
+    all_polls = [awareness] + llm_polls
+    # exact dedup -> semantic -> stem diversity
+    all_polls = list(dict.fromkeys([normalize_ws(p) for p in all_polls]))
+    all_polls = dedup_semantic(all_polls, max(similarity_dup_threshold, 0.93), embedder)
+
+    # simple stem dedup and cap
+    stems = []
+    final = []
+    for p in all_polls:
+        if len(final) >= MAX_POLLS_PER_ARTICLE:
+            break
+        stem = PollMiner._stem(p.splitlines()[0])
+        if not stems:
+            final.append(p); stems.append(stem); continue
+        if util.cos_sim(embedder.encode(stem), embedder.encode(stems)).max().item() < 0.90:
+            final.append(p); stems.append(stem)
+
+    return final, facts
 
 # =========================
-# FILE INPUTS (repo root only)
+# FILE INPUTS
 # =========================
 st.header("📰 Breast Cancer News → 🗳️ Poll Generator")
 
@@ -771,8 +818,9 @@ if run_btn and articles:
                     st.error(f"#{idx} {headline or '(no headline)'}: {e}")
                     continue
 
-                results.append({"headline": headline, "url": url, "polls": polls})
-
+                # ---- Optional comment input per article ----
+                comment_key = f"comment-{idx}"
+                st.session_state.setdefault(comment_key, "")
                 with st.expander(f"#{idx}  {headline or '(no headline)'}", expanded=False):
                     if url:
                         st.markdown(f"**Source:** [{url}]({url})")
@@ -793,7 +841,7 @@ if run_btn and articles:
                             preview = preview[:600] + "…"
                         st.markdown("> " + preview.replace("\n", " "))
                     st.markdown("---")
-                    st.subheader("Generated Polls")
+                    st.subheader("Generated Polls (max 4)")
                     if not polls:
                         st.info("No unique polls were generated for this article.")
                     else:
@@ -807,6 +855,16 @@ if run_btn and articles:
                                 st.markdown(f"**Q{i}. {q}**")
                                 st.radio(label=" ", options=opts or ["(no options)"], index=None, key=f"{idx}-{i}", disabled=True)
                             st.markdown("")
+                    st.markdown("---")
+                    st.text_area("Optional HCP comment (will be exported)", key=comment_key, height=100)
+
+                # add to results including comment
+                results.append({
+                    "headline": headline,
+                    "url": url,
+                    "polls": polls,
+                    "comment": st.session_state.get(comment_key, "")
+                })
 
         st.markdown("---")
         st.subheader("⬇️ Download")
