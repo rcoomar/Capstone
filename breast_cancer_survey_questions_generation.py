@@ -10,20 +10,16 @@ import numpy as np
 import streamlit as st
 import torch
 from sentence_transformers import SentenceTransformer, util
-
-# Optional (only if you use the HF path)
-from huggingface_hub import login as hf_login, InferenceClient
-
-# Optional (only if you use the watsonx path)
-# SDK lazily imported in helpers to avoid hard dependency at import time
-
 from transformers import pipeline, AutoTokenizer
+
+# Optional (HF path only)
+from huggingface_hub import login as hf_login, InferenceClient
 
 # =========================
 # DEFAULTS / CONSTANTS
 # =========================
-LLAMA_MODEL = "meta-llama/llama-3-3-70b-instruct"      # Your target model (chat_model on watsonx)
-MISTRAL_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"    # Optional alt
+LLAMA_MODEL = "meta-llama/llama-3-3-70b-instruct"      # chat_model on watsonx
+MISTRAL_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"    # optional alt
 MAX_TWEET_CHARS = 280
 MAX_POLL_OPTIONS = 4
 
@@ -35,35 +31,34 @@ st.set_page_config(page_title="Breast Cancer News → Poll Generator", layout="w
 with st.sidebar:
     st.title("⚙️ Settings")
 
-    # Provider selection
     provider = st.selectbox(
         "Provider",
         ["watsonx", "huggingface"],
         index=0,
-        help="Choose where to call the model from."
+        help="Pick the platform to call the model."
     )
 
-    # Model
     model_name = st.selectbox(
         "Model",
         [LLAMA_MODEL, MISTRAL_MODEL],
-        index=0 if provider == "watsonx" else 0,
-        help="Llama 3.3 70B Instruct (chat_model on watsonx) or Mistral 7B."
+        index=0,
+        help="Llama 3.3 70B Instruct (watsonx chat_model) or Mistral 7B Instruct."
     )
 
-    # Credentials / toggles per provider
     if provider == "watsonx":
-        wxa_api_key = st.text_input("watsonx API key", type="password", help="IBM Cloud API key")
-        wxa_url = st.text_input("watsonx URL", value="https://us-south.ml.cloud.ibm.com", help="Your watsonx.ai instance URL")
-        wxa_project_id = st.text_input("watsonx Project ID (or Space ID)", help="Project ID (or Space ID if you use spaces)")
+        wxa_api_key = st.text_input("watsonx API key", type="password")
+        wxa_url = st.text_input("watsonx URL", value="https://us-south.ml.cloud.ibm.com")
+        wxa_project_or_space = st.text_input(
+            "watsonx Project ID (or Space ID)",
+            help="If a Space, you can enter either the raw space id or 'space:<id>'."
+        )
         use_hf_inference = False
         hf_token = None
     else:
         default_token = st.secrets.get("HF_TOKEN", "")
         hf_token = st.text_input("Hugging Face token", value=default_token, type="password",
-                                 help="Fine-grained token with 'Make calls to Inference Providers' (if using HF router).")
-        use_hf_inference = st.toggle("Use HF Inference API (recommended)", value=True,
-                                     help="ON = call via HF Inference API; OFF = local Mistral (GPU required).")
+                                 help="Fine-grained token with 'Make calls to Inference Providers'.")
+        use_hf_inference = st.toggle("Use HF Inference API (recommended)", value=True)
 
     passes_per_article = st.slider("Generation passes per article", 1, 6, 3)
     temperature = st.slider("Temperature (creativity)", 0.0, 1.2, 0.8, 0.1)
@@ -72,24 +67,24 @@ with st.sidebar:
     max_new_tokens = st.slider(
         "Max new tokens per pass",
         min_value=128, max_value=1024, value=480, step=32,
-        help="Increase if polls are getting cut off mid-sentence."
+        help="Raise this if polls are getting cut off mid-sentence."
     )
 
     similarity_dup_threshold = st.slider(
         "Semantic de-dup threshold", 0.80, 0.99, 0.90, 0.01,
-        help="Higher = keep only more distinct polls"
+        help="Higher = keep only more distinct polls."
     )
 
     allow_rule_fallback = st.toggle(
         "Allow rule-based fallback if LLM fails",
         value=False,
-        help="Turn on only if you're okay with generic polls when the model is unavailable."
+        help="Turn ON only if you're okay with generic polls when the model is unavailable."
     )
 
     st.markdown("---")
-    st.caption("Upload a JSON list like: `[{'headline','url','content'} , ...]`")
+    st.caption("Upload a JSON list like: `[{'headline','url','content'}, ...]`")
 
-# Authenticate HF if selected
+# Authenticate HF (if used)
 if provider == "huggingface" and hf_token:
     try:
         hf_login(token=hf_token)
@@ -112,14 +107,11 @@ def get_hf_inference_client(model_id: str, token: Optional[str]):
 
 @st.cache_resource(show_spinner=False)
 def get_local_mistral_pipeline(_model_name: str, token: Optional[str]):
-    """
-    Local loading for Mistral (GPU strongly recommended). Llama 70B is API-only here.
-    """
     is_mistral = "mistral" in _model_name.lower()
     if not is_mistral:
         raise RuntimeError("Local mode only supports Mistral in this app.")
     cuda = torch.cuda.is_available()
-    st.info("🔧 Loading Mistral locally. Expect ≈14GB+ VRAM requirement.")
+    st.info("🔧 Loading Mistral locally (needs ~14GB+ VRAM).")
     dtype = torch.float16 if cuda else torch.float32
     tok = AutoTokenizer.from_pretrained(_model_name, token=token, trust_remote_code=True)
     pipe = pipeline(
@@ -132,28 +124,29 @@ def get_local_mistral_pipeline(_model_name: str, token: Optional[str]):
     )
     return pipe
 
-# ---- watsonx client helpers ----
+# ---- watsonx helper (feature-detect chat vs text) ----
 @st.cache_resource(show_spinner=False)
-def get_watsonx_model_chat(model_id: str, api_key: str, url: str, project_or_space_id: str, params: dict):
-    from ibm_watsonx_ai import Credentials
-    from ibm_watsonx_ai.foundation_models import Model
-    creds = Credentials(url=url, api_key=api_key)
-    # project_id OR space_id – pick the right kwarg based on what the user supplied
-    kwargs = {"project_id": project_or_space_id}
-    if project_or_space_id.startswith("space:") or project_or_space_id.startswith("spaces:"):
-        kwargs = {"space_id": project_or_space_id.split(":", 1)[-1]}
-    mdl = Model(model_id=model_id, credentials=creds, params=params, **kwargs)
-    return mdl.start_chat()
+def get_watsonx_model(model_id: str, api_key: str, url: str, project_or_space_id: str, params: dict):
+    try:
+        from ibm_watsonx_ai import Credentials
+        from ibm_watsonx_ai.foundation_models import Model
+    except ModuleNotFoundError:
+        raise RuntimeError(
+            "ibm-watsonx-ai SDK is not installed. Add 'ibm-watsonx-ai' to requirements.txt and redeploy."
+        )
 
-@st.cache_resource(show_spinner=False)
-def get_watsonx_model_text(model_id: str, api_key: str, url: str, project_or_space_id: str, params: dict):
-    from ibm_watsonx_ai import Credentials
-    from ibm_watsonx_ai.foundation_models import Model
     creds = Credentials(url=url, api_key=api_key)
-    kwargs = {"project_id": project_or_space_id}
-    if project_or_space_id.startswith("space:") or project_or_space_id.startswith("spaces:"):
-        kwargs = {"space_id": project_or_space_id.split(":", 1)[-1]}
-    return Model(model_id=model_id, credentials=creds, params=params, **kwargs)
+
+    # If the user provided a Space id, prefer space_id; else use project_id
+    kwargs = {}
+    token = (project_or_space_id or "").strip()
+    if token.lower().startswith(("space:", "spaces:")):
+        kwargs["space_id"] = token.split(":", 1)[-1]
+    else:
+        kwargs["project_id"] = token
+
+    mdl = Model(model_id=model_id, credentials=creds, params=params, **kwargs)
+    return mdl
 
 # =========================
 # TEXT HELPERS
@@ -328,7 +321,7 @@ def detect_topics(text: str, lower_text: str) -> Dict[str, bool]:
         fda_approval=("fda" in lower_text and re.search(r"\bapprov|\bauthoriz", lower_text)),
         trial=bool(re.search(r"\b(clinical )?trial\b|\bstudy\b", lower_text)),
         acquisition=bool(re.search(r"\bacquisit|acquire|merger\b", lower_text)),
-        partnership=bool(research := re.search(r"\b(partner|collaborat|licens|alliance)\w*\b", lower_text)),
+        partnership=bool(re.search(r"\b(partner|collaborat|licens|alliance)\w*\b", lower_text)),
         endpoints=bool(re.search(r"\bprogression[- ]free survival\b|\bPFS\b|\boverall survival\b|\bOS\b|\bORR\b|\bresponse rate\b", text, flags=re.I)),
         setting_firstline=bool(re.search(r"\bfirst[- ]?line\b", lower_text)),
         setting_adjuvant=bool(re.search(r"\badjuvant\b", lower_text)),
@@ -384,30 +377,27 @@ def build_awareness_poll(headline: str, content: str, url: str) -> str:
 class PollMiner:
     def __init__(self, _model_name: str, provider: str, use_hf_inference: bool,
                  hf_token: Optional[str],
-                 wxa_api_key: Optional[str], wxa_url: Optional[str], wxa_project_id: Optional[str]):
+                 wxa_api_key: Optional[str], wxa_url: Optional[str], wxa_project_or_space: Optional[str]):
         self.model_name = _model_name
         self.provider = provider
         self.is_mistral = "mistral" in _model_name.lower()
-        self.is_llama = "llama" in _model_name.lower()
 
         self.hf_client = None
         self.gen_pipeline = None
-        self.wxa_chat = None
-        self.wxa_text = None
+        self.wxa_model = None
 
         try:
             if provider == "watsonx":
-                if not (wxa_api_key and wxa_url and wxa_project_id):
+                if not (wxa_api_key and wxa_url and wxa_project_or_space):
                     raise RuntimeError("Missing watsonx credentials (API key, URL, Project/Space ID).")
 
                 base_params = {
                     "decoding_method": "sample",
                     "temperature": 0.8,
                     "top_p": 0.9,
-                    "max_new_tokens": 480
+                    "max_new_tokens": 480,
                 }
-                self.wxa_chat = get_watsonx_model_chat(_model_name, wxa_api_key, wxa_url, wxa_project_id, base_params)
-                self.wxa_text = get_watsonx_model_text(_model_name, wxa_api_key, wxa_url, wxa_project_id, base_params)
+                self.wxa_model = get_watsonx_model(_model_name, wxa_api_key, wxa_url, wxa_project_or_space, base_params)
 
             elif provider == "huggingface":
                 if use_hf_inference:
@@ -423,8 +413,7 @@ class PollMiner:
             st.error(f"❌ Model init failed: {e}")
             self.hf_client = None
             self.gen_pipeline = None
-            self.wxa_chat = None
-            self.wxa_text = None
+            self.wxa_model = None
 
     def _format_prompt(self, headline: str, url: str, content: str, facts: Dict) -> str:
         snippet = content.strip()
@@ -473,47 +462,48 @@ Q: <practice-focused question with specific clinical context>
 - Option 4 (optional)
 """
 
-    # ----- Provider-specific generate calls -----
+    # ----- Provider-specific calls -----
     def _gen_watsonx(self, prompt: str, temperature: float, top_p: float, max_new_tokens: int) -> str:
-        # Prefer chat for chat_model
+        if not self.wxa_model:
+            raise RuntimeError("watsonx model not initialized")
+
+        # Update params per call (if supported by SDK)
         try:
-            if self.wxa_chat:
-                self.wxa_chat.model.params.update({
-                    "temperature": float(temperature),
-                    "top_p": float(top_p),
-                    "max_new_tokens": int(max_new_tokens),
-                    "decoding_method": "sample",
-                })
-                resp = self.wxa_chat.send_message(prompt)
+            self.wxa_model.params.update({
+                "temperature": float(temperature),
+                "top_p": float(top_p),
+                "max_new_tokens": int(max_new_tokens),
+                "decoding_method": "sample",
+            })
+        except Exception:
+            pass
+
+        # Try chat path if SDK has it
+        try:
+            if hasattr(self.wxa_model, "start_chat"):
+                chat = self.wxa_model.start_chat()
+                resp = chat.send_message(prompt)
                 text = getattr(resp, "message", None) or getattr(resp, "generated_text", None)
                 if isinstance(text, str) and text.strip():
                     return text
                 if isinstance(resp, dict):
                     return resp.get("generated_text") or resp.get("message") or json.dumps(resp)
         except Exception:
-            pass  # fall back to text
+            pass  # fall through to generate_text
 
-        if self.wxa_text:
-            self.wxa_text.params.update({
-                "temperature": float(temperature),
-                "top_p": float(top_p),
-                "max_new_tokens": int(max_new_tokens),
-                "decoding_method": "sample",
-            })
-            result = self.wxa_text.generate_text(prompt=prompt)
-            if isinstance(result, str):
-                return result
-            if isinstance(result, dict):
-                if "results" in result and result["results"]:
-                    cand = result["results"][0].get("generated_text") or result["results"][0].get("text")
-                    if cand:
-                        return cand
-                return result.get("generated_text") or json.dumps(result)
-
-        raise RuntimeError("watsonx generation failed (chat & text).")
+        # Fallback: plain text generation (works across SDK versions)
+        result = self.wxa_model.generate_text(prompt=prompt)
+        if isinstance(result, str):
+            return result
+        if isinstance(result, dict):
+            if "results" in result and result["results"]:
+                cand = result["results"][0].get("generated_text") or result["results"][0].get("text")
+                if cand:
+                    return cand
+            return result.get("generated_text") or json.dumps(result)
+        return str(result)
 
     def _gen_hf(self, prompt: str, temperature: float, top_p: float, max_new_tokens: int) -> str:
-        # Prefer chat if available (many providers expose conversational)
         chat = getattr(self.hf_client, "chat", None)
         if chat and hasattr(chat, "completions") and hasattr(chat.completions, "create"):
             resp = chat.completions.create(
@@ -543,7 +533,7 @@ Q: <practice-focused question with specific clinical context>
     def generate(self, headline: str, url: str, content: str, facts: Dict,
                  passes: int, temperature: float, top_p: float, max_new_tokens: int) -> List[str]:
 
-        ready = any([self.wxa_chat, self.wxa_text, self.hf_client, self.gen_pipeline])
+        ready = any([self.wxa_model, self.hf_client, self.gen_pipeline])
         if not ready:
             st.warning("Model not initialized; using rule-based fallback.")
             return []
@@ -699,7 +689,7 @@ def build_polls_for_article(headline: str, url: str, content: str):
         hf_token,
         wxa_api_key if provider == "watsonx" else None,
         wxa_url if provider == "watsonx" else None,
-        wxa_project_id if provider == "watsonx" else None
+        wxa_project_or_space if provider == "watsonx" else None
     )
 
     llm_polls = miner.generate(headline, url, content, facts,
@@ -787,7 +777,7 @@ results = []
 if run_btn and articles:
     if provider == "huggingface" and use_hf_inference and not hf_token:
         st.error("You selected HF Inference API but no token is set.")
-    elif provider == "watsonx" and not (wxa_api_key and wxa_url and wxa_project_id):
+    elif provider == "watsonx" and not (wxa_api_key and wxa_url and wxa_project_or_space):
         st.error("watsonx selected but credentials are missing.")
     else:
         with st.spinner("Generating polls…"):
@@ -850,7 +840,7 @@ if run_btn and articles:
 
 st.markdown("---")
 st.caption(
-    "Tip: If polls look truncated, raise 'Max new tokens per pass'. "
+    "If polls look truncated, raise 'Max new tokens per pass'. "
     "For watsonx, provide API key, instance URL, and Project/Space ID. "
     "For HF, ensure your token allows 'Make calls to Inference Providers'."
 )
