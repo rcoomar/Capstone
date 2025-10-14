@@ -9,30 +9,40 @@ import numpy as np
 import streamlit as st
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
 from sentence_transformers import SentenceTransformer, util
-from huggingface_hub import login  # Added import
+from huggingface_hub import login, HfFolder  # Added import
 
 # =========================
 # HUGGING FACE AUTHENTICATION
 # =========================
-# Add this section at the top of your sidebar or in a secure configuration section
+st.set_page_config(page_title="Breast Cancer News → Poll Generator", layout="wide")
+
+# Initialize session state for auth status
+if 'hf_authenticated' not in st.session_state:
+    st.session_state.hf_authenticated = False
+if 'current_model' not in st.session_state:
+    st.session_state.current_model = "google/flan-t5-base"
+
 with st.sidebar:
     st.title("🔐 Hugging Face Setup")
     hf_token = st.text_input(
-        "Hugging Face API Token",
+        "Hugging Face API Token (optional)",
         type="password",
-        help="Enter your Hugging Face token to use BioMistral model"
+        help="Enter your Hugging Face token to use BioMistral model. Leave empty to use Flan-T5."
     )
-    if hf_token:
+    
+    if st.button("Authenticate") and hf_token:
         try:
             login(token=hf_token)
+            HfFolder.save_token(hf_token)
+            st.session_state.hf_authenticated = True
             st.success("✅ Successfully authenticated with Hugging Face!")
         except Exception as e:
             st.error(f"❌ Authentication failed: {e}")
+            st.session_state.hf_authenticated = False
 
 # =========================
 # DEFAULTS - UPDATED MODEL
 # =========================
-DEFAULT_MODEL_NAME = "mistralai/BioMistral-7B"  # Updated model name
 MAX_NEW_TOKENS = 200
 MAX_TWEET_CHARS = 280
 MAX_POLL_OPTIONS = 4
@@ -40,20 +50,35 @@ MAX_POLL_OPTIONS = 4
 # =========================
 # UI SIDEBAR - UPDATED MODEL OPTIONS
 # =========================
-st.set_page_config(page_title="Breast Cancer News → Poll Generator", layout="wide")
-
 with st.sidebar:
     st.title("⚙️ Settings")
+    
+    # Model selection based on authentication
+    if st.session_state.hf_authenticated:
+        model_options = [
+            "mistralai/BioMistral-7B",
+            "google/flan-t5-base", 
+            "google/flan-t5-large"
+        ]
+        default_index = 0
+    else:
+        model_options = [
+            "google/flan-t5-base",
+            "google/flan-t5-large"
+        ]
+        default_index = 0
+        st.info("🔒 Enter HF token above to use BioMistral")
+    
     model_name = st.selectbox(
         "LLM Model:",
-        [
-            "mistralai/BioMistral-7B",  # Primary choice
-            "google/flan-t5-base",      # Fallback option
-            "google/flan-t5-large"      # Fallback option
-        ],
-        index=0,
-        help="BioMistral for medical content, Flan-T5 as fallback. BioMistral requires HF token."
+        model_options,
+        index=default_index,
+        help="BioMistral for medical content, Flan-T5 as fallback."
     )
+    
+    # Update session state
+    st.session_state.current_model = model_name
+    
     passes_per_article = st.slider("Generation passes per article", 1, 6, 3)
     temperature = st.slider("Temperature (creativity)", 0.0, 1.2, 0.8, 0.1)
     top_p = st.slider("Top-p (nucleus sampling)", 0.1, 1.0, 0.9, 0.05)
@@ -63,23 +88,31 @@ with st.sidebar:
     st.caption("Upload a JSON list like: `[{'headline','url','content'}, ...]`")
 
 # =========================
-# CACHING HEAVY OBJECTS - UPDATED FOR BIO MISTRAL
+# CACHING HEAVY OBJECTS - UPDATED WITH ERROR HANDLING
 # =========================
 @st.cache_resource(show_spinner=False)
-def get_text_generation_pipeline(model_name: str):
-    """Get appropriate pipeline based on model type"""
-    if "BioMistral" in model_name or "mistral" in model_name.lower():
-        # Use text-generation pipeline for causal LM
-        return pipeline(
-            "text-generation",
-            model=model_name,
-            tokenizer=AutoTokenizer.from_pretrained(model_name),
-            device_map="auto",
-            torch_dtype="auto"  # Automatically handle dtype
-        )
-    else:
-        # Fallback to text2text for Flan models
-        return pipeline("text2text-generation", model=model_name, device_map="auto")
+def get_text_generation_pipeline(_model_name: str):
+    """Get appropriate pipeline based on model type with error handling"""
+    try:
+        if "BioMistral" in _model_name or "mistral" in _model_name.lower():
+            # Use text-generation pipeline for causal LM
+            st.info(f"🔄 Loading BioMistral model... This may take a few minutes.")
+            return pipeline(
+                "text-generation",
+                model=_model_name,
+                tokenizer=AutoTokenizer.from_pretrained(_model_name),
+                device_map="auto",
+                torch_dtype="auto",
+                trust_remote_code=True
+            )
+        else:
+            # Fallback to text2text for Flan models
+            st.info(f"🔄 Loading {_model_name}...")
+            return pipeline("text2text-generation", model=_model_name, device_map="auto")
+    except Exception as e:
+        st.error(f"❌ Failed to load model {_model_name}: {str(e)}")
+        st.warning("🔄 Falling back to google/flan-t5-base")
+        return pipeline("text2text-generation", model="google/flan-t5-base", device_map="auto")
 
 @st.cache_resource(show_spinner=False)
 def get_embedder():
@@ -362,12 +395,20 @@ def build_awareness_poll(headline: str, content: str, url: str) -> str:
     return poll
 
 # =========================
-# LLM MINER - UPDATED FOR BIO MISTRAL WITH PRACTICE FOCUS
+# LLM MINER - UPDATED WITH BETTER ERROR HANDLING
 # =========================
 class PollMiner:
-    def __init__(self, model_name: str):
-        self.gen_pipeline = get_text_generation_pipeline(model_name)
-        self.is_bio_mistral = "BioMistral" in model_name or "mistral" in model_name.lower()
+    def __init__(self, _model_name: str):
+        try:
+            self.gen_pipeline = get_text_generation_pipeline(_model_name)
+            self.is_bio_mistral = "BioMistral" in _model_name or "mistral" in _model_name.lower()
+            self.model_loaded = True
+        except Exception as e:
+            st.error(f"Failed to initialize model {_model_name}: {e}")
+            # Fallback to Flan-T5
+            self.gen_pipeline = get_text_generation_pipeline("google/flan-t5-base")
+            self.is_bio_mistral = False
+            self.model_loaded = False
 
     def _format_bio_mistral_prompt(self, headline: str, url: str, content: str, facts: Dict) -> str:
         """Format prompt specifically for BioMistral with practice-focused questions"""
@@ -466,6 +507,9 @@ Q: <practice-impact question with specific context>
 
     def generate(self, headline: str, url: str, content: str, facts: Dict,
                  passes: int, temperature: float, top_p: float) -> List[str]:
+        if not self.model_loaded:
+            st.warning("Using fallback model (google/flan-t5-base) for generation.")
+        
         all_blocks: List[str] = []
         
         for _ in range(passes):
@@ -480,11 +524,11 @@ Q: <practice-impact question with specific context>
                         top_p=top_p,
                         num_return_sequences=1,
                         pad_token_id=self.gen_pipeline.tokenizer.eos_token_id,
-                        return_full_text=False  # Don't repeat the prompt
+                        return_full_text=False
                     )
                     out = result[0]["generated_text"]
                 else:
-                    # Original Flan-T5 generation
+                    # Flan-T5 generation
                     result = self.gen_pipeline(
                         self._prompt(headline, url, content, facts),
                         max_new_tokens=MAX_NEW_TOKENS,
@@ -617,7 +661,11 @@ def rule_based_polls(facts: Dict) -> List[str]:
 def build_polls_for_article(headline: str, url: str, content: str) -> List[str]:
     facts = extract_facts(headline, content, url)
     awareness = build_awareness_poll(headline, content, url)
-    miner = PollMiner(model_name)
+    
+    # Use the model from session state
+    current_model = st.session_state.current_model
+    miner = PollMiner(current_model)
+    
     llm_polls = miner.generate(headline, url, content, facts,
                                passes_per_article, temperature, top_p)
     if not llm_polls:
