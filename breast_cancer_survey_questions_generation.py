@@ -9,16 +9,21 @@ from urllib.parse import urlparse
 import numpy as np
 import streamlit as st
 import torch
-
-from huggingface_hub import login, InferenceClient
-from transformers import pipeline, AutoTokenizer
 from sentence_transformers import SentenceTransformer, util
 
+# Optional (only if you use the HF path)
+from huggingface_hub import login as hf_login, InferenceClient
+
+# Optional (only if you use the watsonx path)
+# SDK lazily imported in helpers to avoid hard dependency at import time
+
+from transformers import pipeline, AutoTokenizer
+
 # =========================
-# DEFAULTS
+# DEFAULTS / CONSTANTS
 # =========================
-DEFAULT_MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.2"
-MAX_NEW_TOKENS = 200
+LLAMA_MODEL = "meta-llama/llama-3-3-70b-instruct"      # Your target model (chat_model on watsonx)
+MISTRAL_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"    # Optional alt
 MAX_TWEET_CHARS = 280
 MAX_POLL_OPTIONS = 4
 
@@ -30,44 +35,64 @@ st.set_page_config(page_title="Breast Cancer News → Poll Generator", layout="w
 with st.sidebar:
     st.title("⚙️ Settings")
 
-    # HF token from secrets or UI
-    default_token = st.secrets.get("HF_TOKEN", "")
-    hf_token = st.text_input(
-        "Hugging Face token",
-        value=default_token,
-        type="password",
-        help="Create at https://huggingface.co/settings/tokens and enable Inference API."
-    )
-
-    # choose inference vs local
-    use_hf_inference = st.toggle(
-        "Use HF Inference API (recommended)",
-        value=True,
-        help="If ON, Mistral runs via HF Inference API with your token. If OFF, load locally (big GPU needed)."
-    )
-
-    # fixed to mistral to avoid FLAN fallback
-    model_name = st.selectbox(
-        "LLM Model (Mistral only in this build):",
-        [DEFAULT_MODEL_NAME],
+    # Provider selection
+    provider = st.selectbox(
+        "Provider",
+        ["watsonx", "huggingface"],
         index=0,
-        help="This app targets Mistral-7B-Instruct. Switch OFF API to try local loading."
+        help="Choose where to call the model from."
     )
+
+    # Model
+    model_name = st.selectbox(
+        "Model",
+        [LLAMA_MODEL, MISTRAL_MODEL],
+        index=0 if provider == "watsonx" else 0,
+        help="Llama 3.3 70B Instruct (chat_model on watsonx) or Mistral 7B."
+    )
+
+    # Credentials / toggles per provider
+    if provider == "watsonx":
+        wxa_api_key = st.text_input("watsonx API key", type="password", help="IBM Cloud API key")
+        wxa_url = st.text_input("watsonx URL", value="https://us-south.ml.cloud.ibm.com", help="Your watsonx.ai instance URL")
+        wxa_project_id = st.text_input("watsonx Project ID (or Space ID)", help="Project ID (or Space ID if you use spaces)")
+        use_hf_inference = False
+        hf_token = None
+    else:
+        default_token = st.secrets.get("HF_TOKEN", "")
+        hf_token = st.text_input("Hugging Face token", value=default_token, type="password",
+                                 help="Fine-grained token with 'Make calls to Inference Providers' (if using HF router).")
+        use_hf_inference = st.toggle("Use HF Inference API (recommended)", value=True,
+                                     help="ON = call via HF Inference API; OFF = local Mistral (GPU required).")
 
     passes_per_article = st.slider("Generation passes per article", 1, 6, 3)
     temperature = st.slider("Temperature (creativity)", 0.0, 1.2, 0.8, 0.1)
     top_p = st.slider("Top-p (nucleus sampling)", 0.1, 1.0, 0.9, 0.05)
+
+    max_new_tokens = st.slider(
+        "Max new tokens per pass",
+        min_value=128, max_value=1024, value=480, step=32,
+        help="Increase if polls are getting cut off mid-sentence."
+    )
+
     similarity_dup_threshold = st.slider(
         "Semantic de-dup threshold", 0.80, 0.99, 0.90, 0.01,
         help="Higher = keep only more distinct polls"
     )
-    st.markdown("---")
-    st.caption("Upload a JSON list like: `[{'headline','url','content'}, ...]`")
 
-# authenticate (idempotent)
-if hf_token:
+    allow_rule_fallback = st.toggle(
+        "Allow rule-based fallback if LLM fails",
+        value=False,
+        help="Turn on only if you're okay with generic polls when the model is unavailable."
+    )
+
+    st.markdown("---")
+    st.caption("Upload a JSON list like: `[{'headline','url','content'} , ...]`")
+
+# Authenticate HF if selected
+if provider == "huggingface" and hf_token:
     try:
-        login(token=hf_token)
+        hf_login(token=hf_token)
         os.environ["HUGGINGFACEHUB_API_TOKEN"] = hf_token
     except Exception as e:
         st.warning(f"Could not authenticate to Hugging Face: {e}")
@@ -83,18 +108,18 @@ def get_embedder():
 def get_hf_inference_client(model_id: str, token: Optional[str]):
     if not token:
         raise RuntimeError("No HF token provided for Inference API.")
-    return InferenceClient(model=model_id, token=token, timeout=120)
+    return InferenceClient(model=model_id, token=token, timeout=180)
 
 @st.cache_resource(show_spinner=False)
-def get_local_pipeline(_model_name: str, token: Optional[str]):
+def get_local_mistral_pipeline(_model_name: str, token: Optional[str]):
     """
-    Local loading for Mistral (GPU strongly recommended).
+    Local loading for Mistral (GPU strongly recommended). Llama 70B is API-only here.
     """
     is_mistral = "mistral" in _model_name.lower()
     if not is_mistral:
-        raise RuntimeError("Local mode in this build only supports Mistral.")
+        raise RuntimeError("Local mode only supports Mistral in this app.")
     cuda = torch.cuda.is_available()
-    st.info("🔧 Loading Mistral locally. You need a large GPU (≈14GB+ VRAM).")
+    st.info("🔧 Loading Mistral locally. Expect ≈14GB+ VRAM requirement.")
     dtype = torch.float16 if cuda else torch.float32
     tok = AutoTokenizer.from_pretrained(_model_name, token=token, trust_remote_code=True)
     pipe = pipeline(
@@ -106,6 +131,29 @@ def get_local_pipeline(_model_name: str, token: Optional[str]):
         trust_remote_code=True
     )
     return pipe
+
+# ---- watsonx client helpers ----
+@st.cache_resource(show_spinner=False)
+def get_watsonx_model_chat(model_id: str, api_key: str, url: str, project_or_space_id: str, params: dict):
+    from ibm_watsonx_ai import Credentials
+    from ibm_watsonx_ai.foundation_models import Model
+    creds = Credentials(url=url, api_key=api_key)
+    # project_id OR space_id – pick the right kwarg based on what the user supplied
+    kwargs = {"project_id": project_or_space_id}
+    if project_or_space_id.startswith("space:") or project_or_space_id.startswith("spaces:"):
+        kwargs = {"space_id": project_or_space_id.split(":", 1)[-1]}
+    mdl = Model(model_id=model_id, credentials=creds, params=params, **kwargs)
+    return mdl.start_chat()
+
+@st.cache_resource(show_spinner=False)
+def get_watsonx_model_text(model_id: str, api_key: str, url: str, project_or_space_id: str, params: dict):
+    from ibm_watsonx_ai import Credentials
+    from ibm_watsonx_ai.foundation_models import Model
+    creds = Credentials(url=url, api_key=api_key)
+    kwargs = {"project_id": project_or_space_id}
+    if project_or_space_id.startswith("space:") or project_or_space_id.startswith("spaces:"):
+        kwargs = {"space_id": project_or_space_id.split(":", 1)[-1]}
+    return Model(model_id=model_id, credentials=creds, params=params, **kwargs)
 
 # =========================
 # TEXT HELPERS
@@ -280,7 +328,7 @@ def detect_topics(text: str, lower_text: str) -> Dict[str, bool]:
         fda_approval=("fda" in lower_text and re.search(r"\bapprov|\bauthoriz", lower_text)),
         trial=bool(re.search(r"\b(clinical )?trial\b|\bstudy\b", lower_text)),
         acquisition=bool(re.search(r"\bacquisit|acquire|merger\b", lower_text)),
-        partnership=bool(re.search(r"\b(partner|collaborat|licens|alliance)\w*\b", lower_text)),
+        partnership=bool(research := re.search(r"\b(partner|collaborat|licens|alliance)\w*\b", lower_text)),
         endpoints=bool(re.search(r"\bprogression[- ]free survival\b|\bPFS\b|\boverall survival\b|\bOS\b|\bORR\b|\bresponse rate\b", text, flags=re.I)),
         setting_firstline=bool(re.search(r"\bfirst[- ]?line\b", lower_text)),
         setting_adjuvant=bool(re.search(r"\badjuvant\b", lower_text)),
@@ -312,58 +360,8 @@ def extract_facts(headline: str, content: str, url: str) -> Dict:
     )
 
 # =========================
-# AWARENESS THEME & POLL
+# AWARENESS POLL
 # =========================
-def detect_theme_keyphrase(headline: str, content: str, url: str) -> str:
-    facts = extract_facts(headline, content, url)
-    drug, ind, phase = facts["drug"], facts["indication"], facts["phase"]
-    companies, pub = facts["companies"], facts["publisher"]
-    tp = facts["topics"]
-
-    if tp["fda_approval"]:
-        if drug: return f"FDA approval of {drug} for {ind}"
-        return f"FDA approval for {ind}"
-
-    if tp["trial"]:
-        if phase and drug and companies:
-            return f"phase {phase} clinical trial of {drug} by {companies[0]}"
-        if phase and drug:
-            return f"phase {phase} clinical trial of {drug}"
-        if phase and companies:
-            return f"phase {phase} clinical trial by {companies[0]}"
-        if phase:
-            return f"phase {phase} clinical trial"
-        return "clinical trial"
-
-    if tp["acquisition"]:
-        acq = re.search(r"([A-Z][A-Za-z&\-\s]{2,50})\s+acquire[sd]?\s+([A-Z][A-Za-z0-9&\-\s]{2,50})", f"{headline}\n{content}")
-        if acq:
-            acquirer = acq.group(1).strip(); target = acq.group(2).strip()
-            return f"acquisition of {target} by {acquirer}"
-        uniq = companies.copy()
-        if pub and pub not in uniq: uniq.append(pub)
-        if len(uniq) >= 2:
-            return f"acquisition involving {uniq[0]} and {uniq[1]}"
-
-    if tp["partnership"]:
-        uniq = companies.copy()
-        if pub and pub not in uniq: uniq.append(pub)
-        if len(uniq) >= 2:
-            return f"partnership between {uniq[0]} and {uniq[1]}"
-        return "industry partnership"
-
-    if tp["endpoints"]:
-        if phase:
-            return f"{'phase ' + phase + ' ' if phase else ''}trial results in {ind}"
-        return f"clinical study results in {ind}"
-
-    headline_short = re.sub(r"\s+", " ", (headline or "")).strip()
-    if not headline_short or len(headline_short) > 60:
-        headline_short = "breast cancer"
-    if pub:
-        return f"{headline_short} overview by {pub}"
-    return headline_short
-
 def build_awareness_poll(headline: str, content: str, url: str) -> str:
     facts = extract_facts(headline, content, url)
     drug, ind = facts["drug"], facts["indication"]
@@ -381,34 +379,57 @@ def build_awareness_poll(headline: str, content: str, url: str) -> str:
     return poll
 
 # =========================
-# LLM MINER (Mistral only; HF Inference chat fallback; no FLAN)
+# LLM MINER (watsonx + HF + local Mistral)
 # =========================
 class PollMiner:
-    def __init__(self, _model_name: str, use_inference_api: bool, token: Optional[str]):
+    def __init__(self, _model_name: str, provider: str, use_hf_inference: bool,
+                 hf_token: Optional[str],
+                 wxa_api_key: Optional[str], wxa_url: Optional[str], wxa_project_id: Optional[str]):
         self.model_name = _model_name
+        self.provider = provider
         self.is_mistral = "mistral" in _model_name.lower()
-        self.use_inference_api = use_inference_api and self.is_mistral
+        self.is_llama = "llama" in _model_name.lower()
 
         self.hf_client = None
         self.gen_pipeline = None
-
-        if not self.is_mistral:
-            raise RuntimeError("Only Mistral is supported in this build.")
+        self.wxa_chat = None
+        self.wxa_text = None
 
         try:
-            if self.use_inference_api:
-                self.hf_client = get_hf_inference_client(_model_name, token)
+            if provider == "watsonx":
+                if not (wxa_api_key and wxa_url and wxa_project_id):
+                    raise RuntimeError("Missing watsonx credentials (API key, URL, Project/Space ID).")
+
+                base_params = {
+                    "decoding_method": "sample",
+                    "temperature": 0.8,
+                    "top_p": 0.9,
+                    "max_new_tokens": 480
+                }
+                self.wxa_chat = get_watsonx_model_chat(_model_name, wxa_api_key, wxa_url, wxa_project_id, base_params)
+                self.wxa_text = get_watsonx_model_text(_model_name, wxa_api_key, wxa_url, wxa_project_id, base_params)
+
+            elif provider == "huggingface":
+                if use_hf_inference:
+                    self.hf_client = get_hf_inference_client(_model_name, hf_token)
+                else:
+                    if not self.is_mistral:
+                        raise RuntimeError("Local mode only implemented for Mistral.")
+                    self.gen_pipeline = get_local_mistral_pipeline(_model_name, hf_token)
             else:
-                self.gen_pipeline = get_local_pipeline(_model_name, token)
+                raise RuntimeError(f"Unsupported provider: {provider}")
+
         except Exception as e:
-            st.error(f"❌ Failed to initialize Mistral: {e}")
+            st.error(f"❌ Model init failed: {e}")
             self.hf_client = None
             self.gen_pipeline = None
+            self.wxa_chat = None
+            self.wxa_text = None
 
-    def _format_mistral_prompt(self, headline: str, url: str, content: str, facts: Dict) -> str:
+    def _format_prompt(self, headline: str, url: str, content: str, facts: Dict) -> str:
         snippet = content.strip()
-        if len(snippet) > 1000:
-            snippet = snippet[:1000]
+        if len(snippet) > 1600:
+            snippet = snippet[:1600]
         facts_str = json.dumps({
             "drug": facts["drug"],
             "companies": facts["companies"][:3],
@@ -417,7 +438,8 @@ class PollMiner:
             "topics_true": [k for k, v in facts["topics"].items() if v]
         }, ensure_ascii=False)
 
-        return f"""<s>[INST] You are a medical content specialist creating Twitter/X poll questions about breast cancer news.
+        return f"""
+You are a medical content specialist creating Twitter/X poll questions about breast cancer news.
 
 TASK: Generate practice-focused Twitter/X poll questions that assess how this medical information impacts clinical practice.
 
@@ -433,13 +455,14 @@ CRITICAL RULES:
 - No invented details, no promotional language, no medical advice.
 - Each poll must be under 280 characters including the question and options.
 - Provide 3-4 concise, clinically relevant options.
+- IMPORTANT: Do not stop mid-sentence. Return complete polls with complete options.
 
 ARTICLE INFORMATION:
 Headline: "{headline}"
 URL: {url}
 Key Facts: {facts_str}
 
-ARTICLE CONTENT:
+ARTICLE CONTENT (truncated):
 {snippet}
 
 Generate several DISTINCT practice-focused poll questions. Format each poll as:
@@ -448,96 +471,115 @@ Q: <practice-focused question with specific clinical context>
 - Option 2
 - Option 3
 - Option 4 (optional)
+"""
 
-Ensure each question assesses clinical utility and practice impact. [/INST]"""
-
-    def _generate_with_inference_api(self, prompt: str, temperature: float, top_p: float) -> str:
-        """
-        Try text_generation first. If provider only supports 'conversational',
-        automatically switch to chat endpoint.
-        """
-        # Attempt text-generation
+    # ----- Provider-specific generate calls -----
+    def _gen_watsonx(self, prompt: str, temperature: float, top_p: float, max_new_tokens: int) -> str:
+        # Prefer chat for chat_model
         try:
-            return self.hf_client.text_generation(
-                prompt,
-                max_new_tokens=MAX_NEW_TOKENS,
+            if self.wxa_chat:
+                self.wxa_chat.model.params.update({
+                    "temperature": float(temperature),
+                    "top_p": float(top_p),
+                    "max_new_tokens": int(max_new_tokens),
+                    "decoding_method": "sample",
+                })
+                resp = self.wxa_chat.send_message(prompt)
+                text = getattr(resp, "message", None) or getattr(resp, "generated_text", None)
+                if isinstance(text, str) and text.strip():
+                    return text
+                if isinstance(resp, dict):
+                    return resp.get("generated_text") or resp.get("message") or json.dumps(resp)
+        except Exception:
+            pass  # fall back to text
+
+        if self.wxa_text:
+            self.wxa_text.params.update({
+                "temperature": float(temperature),
+                "top_p": float(top_p),
+                "max_new_tokens": int(max_new_tokens),
+                "decoding_method": "sample",
+            })
+            result = self.wxa_text.generate_text(prompt=prompt)
+            if isinstance(result, str):
+                return result
+            if isinstance(result, dict):
+                if "results" in result and result["results"]:
+                    cand = result["results"][0].get("generated_text") or result["results"][0].get("text")
+                    if cand:
+                        return cand
+                return result.get("generated_text") or json.dumps(result)
+
+        raise RuntimeError("watsonx generation failed (chat & text).")
+
+    def _gen_hf(self, prompt: str, temperature: float, top_p: float, max_new_tokens: int) -> str:
+        # Prefer chat if available (many providers expose conversational)
+        chat = getattr(self.hf_client, "chat", None)
+        if chat and hasattr(chat, "completions") and hasattr(chat.completions, "create"):
+            resp = chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
-                repetition_penalty=1.05,
-                return_full_text=False,
-                stream=False,
             )
-        except Exception as e:
-            err_msg = str(e)
-            if "conversational" in err_msg.lower():
-                # Modern OpenAI-like chat path if available
-                try:
-                    chat = getattr(self.hf_client, "chat", None)
-                    if chat and hasattr(chat, "completions") and hasattr(chat.completions, "create"):
-                        resp = chat.completions.create(
-                            model=self.model_name,
-                            messages=[{"role": "user", "content": prompt}],
-                            max_tokens=MAX_NEW_TOKENS,
-                            temperature=temperature,
-                            top_p=top_p,
-                        )
-                        choice = resp.choices[0]
-                        if hasattr(choice, "message") and choice.message and "content" in choice.message:
-                            return choice.message["content"]
-                        if hasattr(choice, "text"):
-                            return choice.text
-                        raise RuntimeError("Chat completion returned an unexpected schema.")
-                except Exception:
-                    # Legacy API fallback, if present
-                    if hasattr(self.hf_client, "chat_completion"):
-                        resp = self.hf_client.chat_completion(
-                            messages=[{"role": "user", "content": prompt}],
-                            max_tokens=MAX_NEW_TOKENS,
-                            temperature=temperature,
-                            top_p=top_p,
-                        )
-                        if isinstance(resp, dict):
-                            if "choices" in resp and resp["choices"]:
-                                msg = resp["choices"][0].get("message", {})
-                                if "content" in msg:
-                                    return msg["content"]
-                            if "generated_text" in resp:
-                                return resp["generated_text"]
-                        if isinstance(resp, list) and resp and "generated_text" in resp[0]:
-                            return resp[0]["generated_text"]
-                        raise RuntimeError("Legacy chat completion returned an unexpected schema.")
-            # Not conversational-only → surface original error
-            raise
+            choice = resp.choices[0]
+            if hasattr(choice, "message") and choice.message and "content" in choice.message:
+                return choice.message["content"]
+            if hasattr(choice, "text"):
+                return choice.text
+
+        # Fallback to text_generation
+        return self.hf_client.text_generation(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=1.05,
+            return_full_text=False,
+            stream=False,
+        )
 
     def generate(self, headline: str, url: str, content: str, facts: Dict,
-                 passes: int, temperature: float, top_p: float) -> List[str]:
+                 passes: int, temperature: float, top_p: float, max_new_tokens: int) -> List[str]:
 
-        if not self.hf_client and not self.gen_pipeline:
+        ready = any([self.wxa_chat, self.wxa_text, self.hf_client, self.gen_pipeline])
+        if not ready:
             st.warning("Model not initialized; using rule-based fallback.")
             return []
 
         all_blocks: List[str] = []
 
+        # Per-article jitter to reduce sameness
+        seed_jitter = (abs(hash(headline + url)) % 1000) / 1000.0
+        jitter_temp = min(1.2, max(0.2, temperature + (seed_jitter - 0.5) * 0.15))
+        jitter_top_p = min(1.0, max(0.6, top_p + (seed_jitter - 0.5) * 0.15))
+
         for i in range(passes):
             try:
                 with st.spinner(f"Generating polls (pass {i+1}/{passes})..."):
-                    prompt = self._format_mistral_prompt(headline, url, content, facts)
+                    prompt = self._format_prompt(headline, url, content, facts)
 
-                    if self.hf_client:
-                        out = self._generate_with_inference_api(prompt, temperature, top_p)
+                    if self.provider == "watsonx":
+                        out = self._gen_watsonx(prompt, jitter_temp, jitter_top_p, max_new_tokens)
+                        st.caption("✅ Response via watsonx.ai")
+                    elif self.hf_client:
+                        out = self._gen_hf(prompt, jitter_temp, jitter_top_p, max_new_tokens)
+                        st.caption("✅ Response via HF Inference API")
                     else:
-                        # Local causal LM pipeline (Mistral)
+                        # Local Mistral
                         result = self.gen_pipeline(
                             prompt,
-                            max_new_tokens=MAX_NEW_TOKENS,
+                            max_new_tokens=max_new_tokens,
                             do_sample=True,
-                            temperature=temperature,
-                            top_p=top_p,
+                            temperature=jitter_temp,
+                            top_p=jitter_top_p,
                             num_return_sequences=1,
                             pad_token_id=self.gen_pipeline.tokenizer.eos_token_id,
                             return_full_text=False,
                         )
                         out = result[0]["generated_text"]
+                        st.caption("✅ Response via local Mistral")
 
                     blocks = parse_polls_block(out)
                     for b in blocks:
@@ -551,7 +593,6 @@ Ensure each question assesses clinical utility and practice impact. [/INST]"""
 
         # Exact de-dup
         uniq = list(dict.fromkeys([normalize_ws(b) for b in all_blocks]))
-
         # Semantic de-dup
         embedder = get_embedder()
         uniq = dedup_semantic(uniq, similarity_dup_threshold, embedder)
@@ -591,7 +632,7 @@ Ensure each question assesses clinical utility and practice impact. [/INST]"""
         return final
 
 # =========================
-# RULE-BASED FALLBACK (no LLM)
+# RULE-BASED FALLBACK
 # =========================
 def rule_based_polls(facts: Dict) -> List[str]:
     polls: List[str] = []
@@ -653,11 +694,25 @@ def build_polls_for_article(headline: str, url: str, content: str):
     facts = extract_facts(headline, content, url)
     awareness = build_awareness_poll(headline, content, url)
 
-    miner = PollMiner(model_name, use_hf_inference, hf_token)
+    miner = PollMiner(
+        model_name, provider, use_hf_inference,
+        hf_token,
+        wxa_api_key if provider == "watsonx" else None,
+        wxa_url if provider == "watsonx" else None,
+        wxa_project_id if provider == "watsonx" else None
+    )
+
     llm_polls = miner.generate(headline, url, content, facts,
-                               passes_per_article, temperature, top_p)
+                               passes_per_article, temperature, top_p, max_new_tokens)
+
     if not llm_polls:
-        llm_polls = rule_based_polls(facts)
+        if allow_rule_fallback:
+            llm_polls = rule_based_polls(facts)
+        else:
+            raise RuntimeError(
+                "LLM generation failed. Verify credentials/token and provider access, "
+                "or enable rule-based fallback in the sidebar."
+            )
 
     all_polls = [awareness] + llm_polls
     all_polls = list(dict.fromkeys([normalize_ws(p) for p in all_polls]))
@@ -730,15 +785,22 @@ if run_btn:
 # =========================
 results = []
 if run_btn and articles:
-    if use_hf_inference and not hf_token:
+    if provider == "huggingface" and use_hf_inference and not hf_token:
         st.error("You selected HF Inference API but no token is set.")
+    elif provider == "watsonx" and not (wxa_api_key and wxa_url and wxa_project_id):
+        st.error("watsonx selected but credentials are missing.")
     else:
         with st.spinner("Generating polls…"):
             for idx, art in enumerate(articles, start=1):
                 headline = (art.get("headline") or "").strip()
                 url = (art.get("url") or "").strip()
                 content = (art.get("content") or "").strip()
-                polls, facts = build_polls_for_article(headline, url, content)
+                try:
+                    polls, facts = build_polls_for_article(headline, url, content)
+                except Exception as e:
+                    st.error(f"#{idx} {headline or '(no headline)'}: {e}")
+                    continue
+
                 results.append({"headline": headline, "url": url, "polls": polls})
 
                 with st.expander(f"#{idx}  {headline or '(no headline)'}", expanded=False):
@@ -788,6 +850,7 @@ if run_btn and articles:
 
 st.markdown("---")
 st.caption(
-    "Tip: If polls look too generic, increase passes or keep the Inference API on. "
-    "Each question should mention at least one extracted fact and focus on practice impact."
+    "Tip: If polls look truncated, raise 'Max new tokens per pass'. "
+    "For watsonx, provide API key, instance URL, and Project/Space ID. "
+    "For HF, ensure your token allows 'Make calls to Inference Providers'."
 )
