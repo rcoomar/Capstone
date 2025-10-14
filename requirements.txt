@@ -7,3 +7,5 @@ sentence-transformers
 safetensors
 numpy
 scikit-learn
+huggingface_hub
+ibm-watsonx-ai
