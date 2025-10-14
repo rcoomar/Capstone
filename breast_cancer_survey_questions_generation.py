@@ -3,7 +3,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Set
+from typing import List, Dict, Optional, Set
 from urllib.parse import urlparse
 
 import numpy as np
@@ -70,10 +70,10 @@ with st.sidebar:
         help="Raise this if polls are getting cut off mid-sentence."
     )
 
-    # STRONGER de-dup by default
+    # Uniqueness control (for semantic de-dup)
     similarity_dup_threshold = st.slider(
-        "Semantic de-dup threshold", 0.85, 0.99, 0.96, 0.01,
-        help="Higher = only keep very distinct polls."
+        "Uniqueness threshold (semantic de-dup)", 0.85, 0.99, 0.94, 0.01,
+        help="Higher = only keep very distinct polls (per article)."
     )
 
     allow_rule_fallback = st.toggle(
@@ -156,24 +156,6 @@ AVOID_PHRASES = [
     r"\bbreakthrough\b", r"\bmiracle\b", r"\bgame[- ]?changing\b",
     r"\bcure\b", r"\bguarantee(d)?\b", r"\bperfect\b", r"\bmust[- ]?have\b"
 ]
-
-CAPS_ALLOW = {
-    "FDA","HR+","HER2","HER2+","HER2-","PFS","OS","ORR","DFS","EFS","QoL",
-    "CDK4/6","PIK3CA","PD-1","PD-L1","CTLA-4","AI","IHC","NCCN"
-}
-
-ORG_KEYWORDS = (
-    "pharma|pharmaceutical|pharmaceuticals|therapeutic|therapeutics|bio|biotech|biosciences|"
-    "bioscience|biopharma|ltd|inc|corp|corporation|plc|ag|sa|nv|co|gmbh|kk|kkk|limited|srl"
-)
-
-KNOWN_PHARMA = {
-    "Genentech","Roche","Novartis","Pfizer","AstraZeneca","Eli Lilly","Merck","MSD",
-    "Sanofi","Gilead","BMS","Bristol Myers Squibb","Amgen","GSK","Bayer","Takeda",
-    "Boehringer Ingelheim","BeiGene","Seagen","Sermonix Pharma","Sermonix","AbbVie","Regeneron",
-    "Biogen","Moderna","Vertex","Incyte","Blueprint Medicines","Jazz Pharmaceuticals","Ipsen",
-    "Merck KGaA","Daiichi Sankyo","Astellas","Servier","Exact Sciences","Illumina"
-}
 
 def normalize_ws(s: str) -> str:
     return re.sub(r"[ \t]+", " ", s.strip())
@@ -258,14 +240,14 @@ def dedup_semantic(blocks: List[str], threshold: float, embedder) -> List[str]:
     return keep
 
 # =========================
-# ENTITY/FACT EXTRACTION (tightened)
+# ENTITY/FACT EXTRACTION (unchanged)
 # =========================
-
-ORG_SUFFIXES = r"(?: Inc\.?| Corp\.?| Corporation| Ltd\.?| LLC| plc| AG| SA| NV| Co\.?| GmbH| KGaA| KK| Limited| SRL)"
-PHARMA_HINTS_RE = re.compile(
-    rf"\b([A-Z][A-Za-z&\-]+(?:\s+[A-Z][A-Za-z&\-]+){{0,3}})\s*(?:{ORG_SUFFIXES})?\b",
-    flags=re.UNICODE
-)
+KNOWN_PHARMA = {
+    "Genentech","Roche","Novartis","Pfizer","AstraZeneca","Eli Lilly","Merck",
+    "Sanofi","Gilead","BMS","Amgen","GSK","Bayer","Takeda","Boehringer Ingelheim",
+    "BeiGene","Seagen","Roche Genentech","Sermonix Pharma","Sermonix"
+}
+ORG_SUFFIXES = r"(?: Inc\.?| Corp\.?| Corporation| Ltd\.?| LLC| plc| AG| SA| NV| Co\.?)"
 
 def company_from_url(url: str) -> Optional[str]:
     try:
@@ -284,10 +266,9 @@ def company_from_url(url: str) -> Optional[str]:
             "astrazeneca.com": "AstraZeneca",
             "lilly.com": "Eli Lilly",
             "merck.com": "Merck",
-            "msd.com": "MSD",
             "sanofi.com": "Sanofi",
             "gilead.com": "Gilead",
-            "bms.com": "Bristol Myers Squibb",
+            "bms.com": "BMS",
             "amgen.com": "Amgen",
             "gsk.com": "GSK",
             "bayer.com": "Bayer",
@@ -295,111 +276,42 @@ def company_from_url(url: str) -> Optional[str]:
             "boehringer-ingelheim.com": "Boehringer Ingelheim",
             "beigene.com": "BeiGene",
             "seagen.com": "Seagen",
-            "abbvie.com": "AbbVie",
-            "regeneron.com": "Regeneron",
-            "astellas.com": "Astellas",
-            "daiichisankyo.com": "Daiichi Sankyo",
         }
         if host in mapping:
             return mapping[host]
-        return None
+        parts = host.split(".")
+        brand = parts[-2] if len(parts) >= 2 else parts[0]
+        brand = brand.replace("-", " ").strip()
+        if not brand:
+            return None
+        return brand[0].upper() + brand[1:]
     except Exception:
         return None
 
-def _looks_like_pharma(name: str) -> bool:
-    if name in KNOWN_PHARMA:
-        return True
-    if re.search(rf"\b({ORG_KEYWORDS})\b", name.lower()):
-        return True
-    return False
-
-def find_pharma_biotech_companies(text: str, url: str) -> List[str]:
-    text_clean = re.sub(r"\s+", " ", text)
-    found: Set[str] = set()
-
-    # 1) known pharma names plain
+def find_companies(text: str) -> List[str]:
+    found = set()
     for k in KNOWN_PHARMA:
-        if re.search(rf"\b{k}\b", text_clean, flags=re.I):
+        if re.search(rf"\b{k}\b", text, flags=re.I):
             found.add(k)
+    for m in re.finditer(rf"\b([A-Z][A-Za-z&\-]+(?:\s+[A-Z][A-Za-z&\-]+){{0,2}})(?:{ORG_SUFFIXES})?\b", text):
+        name = m.group(0).strip()
+        if len(name.split()) >= 1 and not re.match(r"^(Q|FDA|HR\+|HER2|\(?HR\+|\(?HER2|PIK3CA|Phase|Breast|Cancer|Trial|Study)$", name):
+            found.add(name)
+    out = [re.sub(r"\s+", " ", f).strip() for f in found]
+    return list({x.lower(): x for x in out}.values())
 
-    # 2) generic org pattern + pharma keywords
-    for m in PHARMA_HINTS_RE.finditer(text_clean):
-        cand = m.group(0).strip()
-        if _looks_like_pharma(cand):
-            found.add(re.sub(r"\s+", " ", cand))
-
-    # 3) simple context cues: "by/ from <Company>"
-    for m in re.finditer(r"\b(?:by|from)\s+([A-Z][A-Za-z&\-\s]{2,60})", text_clean):
-        cand = m.group(1).strip().rstrip(" .,:;")
-        # stop at next lowercase-to-uppercase break
-        cand = re.split(r"\s{2,}|(?:\s(?:the|a|an)\s)", cand)[0]
-        cand = re.sub(r"\s+", " ", cand)
-        if _looks_like_pharma(cand):
-            found.add(cand)
-
-    pub = company_from_url(url)
-    if pub:
-        found.add(pub)
-
-    # De-noise: remove fragments that look like nouns not orgs
-    clean = []
-    for c in found:
-        bad = re.search(r"\b(Study|Trial|Cancer|Approval|Press|Release|Medicine|FDA|Type|First|Immunotherapy)\b", c, flags=re.I)
-        if not bad:
-            clean.append(c)
-
-    # Normalize casing uniqueness
-    uniq = list({x.lower(): x for x in clean}.values())
-    return sorted(uniq, key=lambda s: s.lower())
-
-DRUG_SUFFIXES = (
-    "mab|nib|ciclib|parib|lisib|sertib|zomib|tinib|metinib|rafenib|zumab|penib|trexate|mustine|relix"
-)
-
-def extract_drugs_all(text: str) -> List[str]:
-    t = text
-    drugs: Set[str] = set()
-
-    # 1) Brand/generic pairs: e.g., atezolizumab (Tecentriq) or chemotherapy (Abraxane)
-    for m in re.finditer(r"\b([A-Za-z][A-Za-z0-9\-]{3,})\s*\(([^)]+)\)", t):
-        a, b = m.group(1).strip(), m.group(2).strip()
-        # Keep both if look like drug-like tokens
-        if re.search(rf"({DRUG_SUFFIXES})\b", a.lower()) or len(a) >= 4:
-            drugs.add(a)
-        if len(b) >= 3 and not re.search(r"\s", b):  # one-token brand like Abraxane
-            drugs.add(b)
-
-    # 2) hyphenated generics like nab-paclitaxel / T-DM1
-    for m in re.finditer(r"\b(?:nab-)?[A-Za-z]{3,}(?:-[A-Za-z0-9]{2,})\b", t):
-        cand = m.group(0)
-        if re.search(r"(paclitaxel|dm1|t-dm1|tdm1|capecitabine|cyclophosphamide|carboplatin|cisplatin)", cand, flags=re.I):
-            drugs.add(cand)
-
-    # 3) biologics/small molecules by suffix
-    for m in re.finditer(rf"\b([A-Za-z][a-z][A-Za-z\-]{{2,}}(?:{DRUG_SUFFIXES}))\b", t, flags=re.I):
-        drugs.add(m.group(1))
-
-    # Clean up common non-drug words that slip in
-    blacklist = {"chemotherapy"}  # not a drug name itself
-    drugs = {d.strip(" ,.;:").replace("–", "-") for d in drugs if d.lower() not in blacklist}
-
-    # Normalize case (prefer capitalized)
-    def norm(d: str) -> str:
-        if d.isupper():
-            return d  # like T-DM1
-        return d[0].upper() + d[1:] if d and d[0].isalpha() else d
-
-    uniq = list({x.lower(): norm(x) for x in drugs}.values())
-    return sorted(uniq, key=lambda s: s.lower())
+def pick_drug(text: str, lower_text: str) -> Optional[str]:
+    m = re.search(r"\b([A-Z][A-Za-z0-9\-]{3,}(?:™|®))", text)
+    if m: return m.group(1)
+    m = re.search(r"\b([A-Z][A-Za-z0-9\-]{3,})\s*\(([^)]+)\)", text)
+    if m: return f"{m.group(1)} ({m.group(2)})"
+    m = re.search(r"\b(inavolisib|palbociclib|fulvestrant|trastuzumab|pertuzumab|t-?dm1|olaparib|abemaciclib|ribociclib|alpelisib|everolimus|letrozole|anastrozole|exemestane)\b", lower_text)
+    if m: return m.group(1)
+    return None
 
 def pick_indication(text: str) -> str:
-    m = re.search(r"(HR\+\s*[,/]*\s*HER2-\s*.*?breast cancer|HER2\+\s*.*?breast cancer|HER2-\s*.*?breast cancer|HR\+\s*.*?breast cancer|metastatic breast cancer|early breast cancer|triple[- ]negative breast cancer|TNBC|breast cancer)", text, flags=re.I)
-    if not m:
-        return "breast cancer"
-    ind = m.group(1)
-    # Normalize TNBC expanded form
-    ind = re.sub(r"\bTNBC\b", "triple-negative breast cancer", ind, flags=re.I)
-    return ind
+    m = re.search(r"(HR\+\s*[,/]*\s*HER2-\s*.*?breast cancer|HER2\+\s*.*?breast cancer|HER2-\s*.*?breast cancer|HR\+\s*.*?breast cancer|metastatic breast cancer|early breast cancer|breast cancer)", text, flags=re.I)
+    return m.group(1) if m else "breast cancer"
 
 def pick_phase(lower_text: str) -> Optional[str]:
     m = re.search(r"\bphase\s*(I{1,3}|IV|V|\d)\b", lower_text)
@@ -418,33 +330,31 @@ def detect_topics(text: str, lower_text: str) -> Dict[str, bool]:
         receptor_hrpos=("hr+" in lower_text or "hormone receptor-positive" in lower_text),
         her2_neg=("her2-" in lower_text or "her2-negative" in lower_text),
         her2_pos=("her2+" in lower_text or "her2-positive" in lower_text),
-        tnbc=("tnbc" in lower_text or "triple-negative" in lower_text),
     )
 
 def extract_facts(headline: str, content: str, url: str) -> Dict:
     text = f"{headline or ''}\n{content or ''}"
     text_norm = re.sub(r"\s+", " ", text).strip()
     t = text_norm.lower()
-
-    companies = find_pharma_biotech_companies(text_norm, url)
-    drugs_all = extract_drugs_all(text_norm)
-    drug_primary = drugs_all[0] if drugs_all else None
+    companies = find_companies(text_norm)
+    pub = company_from_url(url) or None
+    if pub and pub not in companies:
+        companies.insert(0, pub)
+    drug = pick_drug(text_norm, t)
     indication = pick_indication(text_norm)
     phase = pick_phase(t)
     topics = detect_topics(text_norm, t)
-
     return dict(
         companies=companies,
-        publisher=company_from_url(url) or None,
-        drug=drug_primary,
-        drugs=drugs_all,
+        publisher=pub,
+        drug=drug,
         indication=indication,
         phase=phase,
         topics=topics
     )
 
 # =========================
-# AWARENESS POLL
+# AWARENESS POLL (unchanged)
 # =========================
 def build_awareness_poll(headline: str, content: str, url: str) -> str:
     facts = extract_facts(headline, content, url)
@@ -481,6 +391,7 @@ class PollMiner:
             if provider == "watsonx":
                 if not (wxa_api_key and wxa_url and wxa_project_or_space):
                     raise RuntimeError("Missing watsonx credentials (API key, URL, Project/Space ID).")
+
                 base_params = {
                     "decoding_method": "sample",
                     "temperature": 0.8,
@@ -505,51 +416,43 @@ class PollMiner:
             self.gen_pipeline = None
             self.wxa_model = None
 
+    # ---------- refined, content-bound prompt ----------
     def _format_prompt(self, headline: str, url: str, content: str, facts: Dict) -> str:
         snippet = content.strip()
         if len(snippet) > 1600:
             snippet = snippet[:1600]
-
         facts_str = json.dumps({
-            "drugs": facts["drugs"],
-            "companies": facts["companies"][:5],
+            "drug": facts["drug"],
+            "companies": facts["companies"][:3],
             "indication": facts["indication"],
             "phase": facts["phase"],
             "topics_true": [k for k, v in facts["topics"].items() if v]
         }, ensure_ascii=False)
 
-        # STRICT relevance and uniqueness instructions
         return f"""
-You are a medical content specialist creating Twitter/X poll questions about breast cancer news.
+You are generating Twitter/X poll questions about a single breast cancer news article.
 
-GOAL: Create several DISTINCT polls that assess PRACTICE IMPACT based ONLY on the headline and article content provided.
-- Do NOT invent facts, drugs, companies, populations, lines of therapy, or endpoints that are not present.
-- All proper nouns (drug names, companies, biomarkers) MUST come from the provided facts/headline/content.
-- Each poll must be unique in focus (utility vs. practice change, endpoints vs. setting, biomarker vs. patient subset, etc.).
-
-CONSTRAINTS:
-- ≤ 280 characters (question + 3–4 options).
-- 3–4 concise, clinically relevant options.
-- Mention specific context (drug, indication, phase/setting, endpoint) when available.
-- If information is missing for a dimension, omit it rather than guessing.
-- Output ONLY poll blocks; no commentary.
+STRICT CONTENT RULES — READ CAREFULLY:
+- USE ONLY information that appears in the headline or article content below (or in Key Facts). Do NOT invent drugs, companies, endpoints, biomarkers, or settings.
+- Each poll MUST clearly reference the specific context present in the article (e.g., drug name, indication, phase/setting, relevant endpoint if mentioned).
+- Produce SEVERAL polls that are mutually DISTINCT in focus (e.g., practice-changing vs. practice-informing, endpoint vs. setting, line of therapy vs. biomarker). Avoid paraphrases.
+- Keep each poll UNDER 280 characters total (question + options) and include 3–4 concise options.
+- Return COMPLETE polls only (no truncated options).
 
 ARTICLE INFORMATION:
 Headline: "{headline}"
 URL: {url}
-Extracted Facts (only use these entities for proper nouns): {facts_str}
+Key Facts (only for grounding; do not add new facts): {facts_str}
 
 ARTICLE CONTENT (truncated):
 {snippet}
 
-FORMAT for each poll:
-Q: <practice-impact question with specific context>
+OUTPUT FORMAT (repeat for several distinct polls; no extra text):
+Q: <question that strictly reflects article content>
 - Option 1
 - Option 2
 - Option 3
 - Option 4 (optional)
-
-Generate several DISTINCT polls now.
 """
 
     # ----- Provider-specific calls -----
@@ -567,7 +470,6 @@ Generate several DISTINCT polls now.
         except Exception:
             pass
 
-        # Try chat if present; otherwise generate_text
         try:
             if hasattr(self.wxa_model, "start_chat"):
                 chat = self.wxa_model.start_chat()
@@ -617,34 +519,20 @@ Generate several DISTINCT polls now.
             stream=False,
         )
 
-    # ----------- Anti-hallucination post-filters ----------
+    # --- lightweight uniqueness-only filtering ---
     @staticmethod
-    def _capitalized_terms_not_in_allowed(poll: str, allowed: Set[str]) -> List[str]:
-        # capture ProperCase tokens and hyphenated caps like T-DM1
-        terms = set(re.findall(r"\b([A-Z][A-Za-z0-9\-]+)\b", poll))
-        offenders = []
-        for t in terms:
-            if t in CAPS_ALLOW:
-                continue
-            if t.lower() in {a.lower() for a in allowed}:
-                continue
-            # Allow common words like Yes/No/Will/How/Is/Phase
-            if re.match(r"^(Q|Yes|No|Will|How|Is|Phase|Option|New|Line|First|Second|Third)$", t):
-                continue
-            offenders.append(t)
-        return offenders
-
-    @staticmethod
-    def _question_stem(poll: str) -> str:
-        first = poll.splitlines()[0].lower()
-        first = re.sub(r"[^a-z0-9 ]", " ", first)
-        first = re.sub(r"\s+", " ", first).strip()
-        return first
+    def _stem(line: str) -> str:
+        s = line.lower()
+        s = re.sub(r"^q\s*:\s*", "", s)
+        s = re.sub(r"[^a-z0-9 ]+", " ", s)
+        s = re.sub(r"\b(the|a|an|for|of|to|in|on|with|about|is|are|this|that|how|will)\b", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
 
     def generate(self, headline: str, url: str, content: str, facts: Dict,
                  passes: int, temperature: float, top_p: float, max_new_tokens: int) -> List[str]:
 
-        ready = any([self.wxa_model, getattr(self, "hf_client", None), self.gen_pipeline])
+        ready = any([self.wxa_model, self.hf_client, self.gen_pipeline])
         if not ready:
             st.warning("Model not initialized; using rule-based fallback.")
             return []
@@ -664,7 +552,7 @@ Generate several DISTINCT polls now.
                     if self.provider == "watsonx":
                         out = self._gen_watsonx(prompt, jitter_temp, jitter_top_p, max_new_tokens)
                         st.caption("✅ Response via watsonx.ai")
-                    elif getattr(self, "hf_client", None):
+                    elif self.hf_client:
                         out = self._gen_hf(prompt, jitter_temp, jitter_top_p, max_new_tokens)
                         st.caption("✅ Response via HF Inference API")
                     else:
@@ -691,51 +579,34 @@ Generate several DISTINCT polls now.
                 st.warning(f"Generation attempt {i+1} failed: {e}")
                 continue
 
-        # ======== DEDUP & STRICT RELEVANCE FILTERS ========
-        # 0) Basic exact dedup
+        # 1) Exact de-dup
         uniq = list(dict.fromkeys([normalize_ws(b) for b in all_blocks]))
 
-        # 1) Semantic de-dup (strict)
+        # 2) Semantic de-dup (configurable threshold)
         embedder = get_embedder()
         uniq = dedup_semantic(uniq, similarity_dup_threshold, embedder)
 
-        # 2) Reject polls with capitalized terms not in allowed entities
-        allowed_entities: Set[str] = set(facts["companies"]) | set(facts["drugs"]) | {facts["indication"]}
-        if facts["phase"]:
-            allowed_entities.add(f"Phase {facts['phase']}")
-        allowed_entities |= {"HER2", "HR+", "HER2-", "HER2+", "TNBC", "PFS", "OS", "ORR"}
+        # 3) Question-stem de-dup (prevents paraphrases of the same idea)
+        final, stems = [], []
+        for blk in uniq:
+            lines = [ln for ln in blk.splitlines() if ln.strip()]
+            if not lines or not lines[0].lower().startswith("q"):
+                continue
+            opts = [ln for ln in lines[1:] if ln.startswith("- ")]
+            if len(opts) < 3:
+                continue
+            if len("\n".join(lines)) > MAX_TWEET_CHARS:
+                continue
 
-        grounded_terms = set()
-        for d in facts["drugs"]:
-            grounded_terms.add(d.lower())
-        for c in facts["companies"]:
-            grounded_terms.add(c.lower())
-        for token in [facts["indication"], facts["phase"], "pik3ca", "hr+", "her2-", "her2+", "pfs", "overall survival", "os", "adjuvant", "first-line", "tnbc"]:
-            if token:
-                grounded_terms.add(str(token).lower())
+            stem = self._stem(lines[0])
+            if not stems:
+                final.append(blk); stems.append(stem); continue
 
-        def grounded(poll: str) -> bool:
-            t = poll.lower()
-            clinical_terms_present = any(term in t for term in grounded_terms)
-            practice_focus_present = any(phrase in t for phrase in [
-                "practice", "clinical", "use this", "impact", "change", "inform",
-                "applicable", "relevant", "approach", "treatment", "discussions"
-            ])
-            offenders = self._capitalized_terms_not_in_allowed(poll, allowed_entities)
-            return clinical_terms_present and practice_focus_present and not offenders
+            # cosine on stems for extra strictness
+            if util.cos_sim(embedder.encode(stem), embedder.encode(stems)).max().item() < 0.90:
+                final.append(blk); stems.append(stem)
 
-        filtered = [p for p in uniq if grounded(p)]
-
-        # 3) Intra-article uniqueness by question stem (kill near-duplicate stems)
-        seen_stems = set()
-        really_final = []
-        for p in filtered:
-            stem = self._question_stem(p)
-            if all(util.cos_sim(embedder.encode(stem), embedder.encode(s)).item() < 0.92 for s in seen_stems) if seen_stems else True:
-                really_final.append(p)
-                seen_stems.add(stem)
-
-        return really_final
+        return final
 
 # =========================
 # RULE-BASED FALLBACK (unchanged)
@@ -790,7 +661,7 @@ def rule_based_polls(facts: Dict) -> List[str]:
         )
 
     embedder = get_embedder()
-    polls = dedup_semantic(list(dict.fromkeys(polls)), 0.95, embedder)
+    polls = dedup_semantic(list(dict.fromkeys(polls)), 0.92, embedder)
     return polls
 
 # =========================
@@ -823,7 +694,7 @@ def build_polls_for_article(headline: str, url: str, content: str):
     all_polls = [awareness] + llm_polls
     all_polls = list(dict.fromkeys([normalize_ws(p) for p in all_polls]))
     embedder = get_embedder()
-    all_polls = dedup_semantic(all_polls, 0.95, embedder)
+    all_polls = dedup_semantic(all_polls, 0.92, embedder)
     if awareness in all_polls and all_polls[0] != awareness:
         all_polls.remove(awareness)
         all_polls.insert(0, awareness)
@@ -915,7 +786,7 @@ if run_btn and articles:
                     col1, col2, col3 = st.columns([1.2, 1, 1])
                     with col1:
                         st.markdown("**Indication:** " + (facts["indication"] or "—"))
-                        st.markdown("**Drug:** " + ((facts["drug"] or "—")))
+                        st.markdown("**Drug:** " + (facts["drug"] or "—"))
                         st.markdown("**Phase:** " + (facts["phase"] or "—"))
                     with col2:
                         st.markdown("**Publisher:** " + (facts["publisher"] or "—"))
@@ -923,8 +794,6 @@ if run_btn and articles:
                     with col3:
                         ts = [k for k, v in facts["topics"].items() if v]
                         st.markdown("**Topics:** " + (", ".join(ts) if ts else "—"))
-                        if facts["drugs"]:
-                            st.markdown("**All drugs:** " + ", ".join(facts["drugs"]))
                     if content:
                         preview = content.strip()
                         if len(preview) > 600:
@@ -933,7 +802,7 @@ if run_btn and articles:
                     st.markdown("---")
                     st.subheader("Generated Polls")
                     if not polls:
-                        st.info("No grounded polls were generated for this article.")
+                        st.info("No unique polls were generated for this article.")
                     else:
                         for i, poll in enumerate(polls, start=1):
                             lines = [ln for ln in poll.splitlines() if ln.strip()]
@@ -959,5 +828,6 @@ if run_btn and articles:
 st.markdown("---")
 st.caption(
     "If polls look truncated, raise 'Max new tokens per pass'. "
-    "Entities are strictly extracted from the article; polls with unknown proper nouns are rejected."
+    "For watsonx, provide API key, instance URL, and Project/Space ID. "
+    "For HF, ensure your token allows 'Make calls to Inference Providers'."
 )
