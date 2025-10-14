@@ -11,9 +11,7 @@ import streamlit as st
 import torch
 from sentence_transformers import SentenceTransformer, util
 from transformers import pipeline, AutoTokenizer
-
-# Optional (HF path only)
-from huggingface_hub import login as hf_login, InferenceClient
+from huggingface_hub import login as hf_login, InferenceClient  # optional (HF path)
 
 # =========================
 # DEFAULTS / CONSTANTS
@@ -70,7 +68,6 @@ with st.sidebar:
         help="Raise this if polls are getting cut off mid-sentence."
     )
 
-    # Uniqueness control (for semantic de-dup)
     similarity_dup_threshold = st.slider(
         "Uniqueness threshold (semantic de-dup)", 0.85, 0.99, 0.94, 0.01,
         help="Higher = only keep very distinct polls (per article)."
@@ -138,7 +135,6 @@ def get_watsonx_model(model_id: str, api_key: str, url: str, project_or_space_id
 
     creds = Credentials(url=url, api_key=api_key)
 
-    # If the user provided a Space id, prefer space_id; else use project_id
     kwargs = {}
     token = (project_or_space_id or "").strip()
     if token.lower().startswith(("space:", "spaces:")):
@@ -240,7 +236,7 @@ def dedup_semantic(blocks: List[str], threshold: float, embedder) -> List[str]:
     return keep
 
 # =========================
-# ENTITY/FACT EXTRACTION (unchanged)
+# ENTITY/FACT EXTRACTION (kept simple)
 # =========================
 KNOWN_PHARMA = {
     "Genentech","Roche","Novartis","Pfizer","AstraZeneca","Eli Lilly","Merck",
@@ -322,7 +318,7 @@ def detect_topics(text: str, lower_text: str) -> Dict[str, bool]:
         fda_approval=("fda" in lower_text and re.search(r"\bapprov|\bauthoriz", lower_text)),
         trial=bool(re.search(r"\b(clinical )?trial\b|\bstudy\b", lower_text)),
         acquisition=bool(re.search(r"\bacquisit|acquire|merger\b", lower_text)),
-        partnership=bool(re.search(r"\b(partner|collaborat|licens|alliance)\w*\b", lower_text)),
+        partnership=bool(research := re.search(r"\b(partner|collaborat|licens|alliance)\w*\b", lower_text)),
         endpoints=bool(re.search(r"\bprogression[- ]free survival\b|\bPFS\b|\boverall survival\b|\bOS\b|\bORR\b|\bresponse rate\b", text, flags=re.I)),
         setting_firstline=bool(re.search(r"\bfirst[- ]?line\b", lower_text)),
         setting_adjuvant=bool(re.search(r"\badjuvant\b", lower_text)),
@@ -354,7 +350,7 @@ def extract_facts(headline: str, content: str, url: str) -> Dict:
     )
 
 # =========================
-# AWARENESS POLL (unchanged)
+# AWARENESS POLL (kept)
 # =========================
 def build_awareness_poll(headline: str, content: str, url: str) -> str:
     facts = extract_facts(headline, content, url)
@@ -416,7 +412,7 @@ class PollMiner:
             self.gen_pipeline = None
             self.wxa_model = None
 
-    # ---------- refined, content-bound prompt ----------
+    # ---------- HCP-perspective, content-bound prompt ----------
     def _format_prompt(self, headline: str, url: str, content: str, facts: Dict) -> str:
         snippet = content.strip()
         if len(snippet) > 1600:
@@ -430,7 +426,7 @@ class PollMiner:
         }, ensure_ascii=False)
 
         return f"""
-You are generating Twitter/X poll questions about a single breast cancer news article.
+You are an assistant that writes Twitter/X poll questions to understand a **doctor's (HCP) perspective** on a single breast cancer news article.
 
 STRICT CONTENT RULES — READ CAREFULLY:
 - USE ONLY information that appears in the headline or article content below (or in Key Facts). Do NOT invent drugs, companies, endpoints, biomarkers, or settings.
@@ -438,6 +434,14 @@ STRICT CONTENT RULES — READ CAREFULLY:
 - Produce SEVERAL polls that are mutually DISTINCT in focus (e.g., practice-changing vs. practice-informing, endpoint vs. setting, line of therapy vs. biomarker). Avoid paraphrases.
 - Keep each poll UNDER 280 characters total (question + options) and include 3–4 concise options.
 - Return COMPLETE polls only (no truncated options).
+- The polls should strictly follow a pattern to learn the **doctor's perspective**: whether this news is practice-informing or practice-changing, whether they will use it in practice, and for which **patient types** this would apply. This agent's goal is NOT general Q&A; it is specifically to elicit HCP practice intent.
+
+Use these HCP-centric question patterns when relevant (adapt wording, do not repeat):
+- "Is this information practice-informing or practice-changing for your [context] patients?"
+- "Will you use this in your clinical practice for [indication/patient subset]?"
+- "For which patients would you consider this (e.g., line of therapy, biomarker, subtype)?"
+- "How will these data affect your treatment discussions (e.g., PFS/OS/ORR if reported)?"
+- "In which setting (adjuvant, first-line, etc.) does this change your approach, if at all?"
 
 ARTICLE INFORMATION:
 Headline: "{headline}"
@@ -448,7 +452,7 @@ ARTICLE CONTENT (truncated):
 {snippet}
 
 OUTPUT FORMAT (repeat for several distinct polls; no extra text):
-Q: <question that strictly reflects article content>
+Q: <HCP-perspective question that strictly reflects article content>
 - Option 1
 - Option 2
 - Option 3
@@ -519,7 +523,7 @@ Q: <question that strictly reflects article content>
             stream=False,
         )
 
-    # --- lightweight uniqueness-only filtering ---
+    # --- uniqueness-only filtering ---
     @staticmethod
     def _stem(line: str) -> str:
         s = line.lower()
@@ -582,11 +586,11 @@ Q: <question that strictly reflects article content>
         # 1) Exact de-dup
         uniq = list(dict.fromkeys([normalize_ws(b) for b in all_blocks]))
 
-        # 2) Semantic de-dup (configurable threshold)
+        # 2) Semantic de-dup
         embedder = get_embedder()
         uniq = dedup_semantic(uniq, similarity_dup_threshold, embedder)
 
-        # 3) Question-stem de-dup (prevents paraphrases of the same idea)
+        # 3) Question-stem de-dup
         final, stems = [], []
         for blk in uniq:
             lines = [ln for ln in blk.splitlines() if ln.strip()]
@@ -602,7 +606,6 @@ Q: <question that strictly reflects article content>
             if not stems:
                 final.append(blk); stems.append(stem); continue
 
-            # cosine on stems for extra strictness
             if util.cos_sim(embedder.encode(stem), embedder.encode(stems)).max().item() < 0.90:
                 final.append(blk); stems.append(stem)
 
@@ -628,36 +631,26 @@ def rule_based_polls(facts: Dict) -> List[str]:
     if drug and ind:
         add(
             f"Is this information about {drug} for {ind} practice-changing for you?",
-            ["Yes, will change my practice", "Informative but no practice change", "Not relevant to my practice", "Need more data"]
+            ["Yes, will change my practice", "Informative but no change", "Not relevant", "Need more data"]
         )
         add(
             f"Will you use this {drug} information in your {ind} practice?",
-            ["Yes, immediately applicable", "Yes, with certain patients", "No, not applicable", "Need guideline updates first"]
+            ["Yes, immediately", "Yes, with select patients", "No", "Awaiting guidelines"]
         )
     if tp["fda_approval"] and drug:
         add(
             f"How practice-informing is the FDA approval of {drug} for {ind}?",
-            ["Highly practice-changing", "Moderately informative", "Minimal impact", "Awaiting real-world data"]
+            ["Practice-changing", "Informative", "Minimal impact", "Need RWE"]
         )
     if tp["trial"] and phase and drug:
         add(
-            f"Does this Phase {phase} {drug} trial data impact your clinical approach to {ind}?",
-            ["Yes, changes my thinking", "Yes, confirms current approach", "No, not convincing", "Need more follow-up"]
-        )
-    if tp["endpoints"] and drug:
-        add(
-            f"How will these {drug} {ind} results influence your treatment discussions?",
-            ["Significantly change discussions", "Modestly inform discussions", "No impact on discussions", "Uncertain until published"]
-        )
-    if companies and drug:
-        add(
-            f"Is this {drug} development by {companies[0]} practice-relevant for your {ind} patients?",
-            ["Yes, highly relevant", "Yes, for some patients", "No, not applicable", "Depends on access/cost"]
+            f"Does this Phase {phase} {drug} trial impact your approach to {ind}?",
+            ["Changes approach", "Confirms current practice", "No impact", "Need follow-up"]
         )
     if ind and not polls:
         add(
-            f"How practice-changing is this {ind} information?",
-            ["Practice-changing", "Practice-informing", "Not practice-impacting", "Uncertain impact"]
+            f"Is this {ind} information practice-informing?",
+            ["Yes", "Somewhat", "Not really", "Unsure"]
         )
 
     embedder = get_embedder()
