@@ -7,29 +7,52 @@ from urllib.parse import urlparse
 
 import numpy as np
 import streamlit as st
-from transformers import pipeline
+from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
 from sentence_transformers import SentenceTransformer, util
+from huggingface_hub import login  # Added import
 
 # =========================
-# DEFAULTS
+# HUGGING FACE AUTHENTICATION
 # =========================
-DEFAULT_MODEL_NAME = "google/flan-t5-base"
+# Add this section at the top of your sidebar or in a secure configuration section
+with st.sidebar:
+    st.title("🔐 Hugging Face Setup")
+    hf_token = st.text_input(
+        "Hugging Face API Token",
+        type="password",
+        help="Enter your Hugging Face token to use BioMistral model"
+    )
+    if hf_token:
+        try:
+            login(token=hf_token)
+            st.success("✅ Successfully authenticated with Hugging Face!")
+        except Exception as e:
+            st.error(f"❌ Authentication failed: {e}")
+
+# =========================
+# DEFAULTS - UPDATED MODEL
+# =========================
+DEFAULT_MODEL_NAME = "mistralai/BioMistral-7B"  # Updated model name
 MAX_NEW_TOKENS = 200
 MAX_TWEET_CHARS = 280
 MAX_POLL_OPTIONS = 4
 
 # =========================
-# UI SIDEBAR
+# UI SIDEBAR - UPDATED MODEL OPTIONS
 # =========================
 st.set_page_config(page_title="Breast Cancer News → Poll Generator", layout="wide")
 
 with st.sidebar:
     st.title("⚙️ Settings")
     model_name = st.selectbox(
-        "LLM (local/CPU-friendly):",
-        ["google/flan-t5-base", "google/flan-t5-large"],
+        "LLM Model:",
+        [
+            "mistralai/BioMistral-7B",  # Primary choice
+            "google/flan-t5-base",      # Fallback option
+            "google/flan-t5-large"      # Fallback option
+        ],
         index=0,
-        help="Small = faster; Large = better quality (needs more RAM)."
+        help="BioMistral for medical content, Flan-T5 as fallback. BioMistral requires HF token."
     )
     passes_per_article = st.slider("Generation passes per article", 1, 6, 3)
     temperature = st.slider("Temperature (creativity)", 0.0, 1.2, 0.8, 0.1)
@@ -40,11 +63,23 @@ with st.sidebar:
     st.caption("Upload a JSON list like: `[{'headline','url','content'}, ...]`")
 
 # =========================
-# CACHING HEAVY OBJECTS
+# CACHING HEAVY OBJECTS - UPDATED FOR BIO MISTRAL
 # =========================
 @st.cache_resource(show_spinner=False)
-def get_text2text_pipeline(model_name: str):
-    return pipeline("text2text-generation", model=model_name, device_map="auto")
+def get_text_generation_pipeline(model_name: str):
+    """Get appropriate pipeline based on model type"""
+    if "BioMistral" in model_name or "mistral" in model_name.lower():
+        # Use text-generation pipeline for causal LM
+        return pipeline(
+            "text-generation",
+            model=model_name,
+            tokenizer=AutoTokenizer.from_pretrained(model_name),
+            device_map="auto",
+            torch_dtype="auto"  # Automatically handle dtype
+        )
+    else:
+        # Fallback to text2text for Flan models
+        return pipeline("text2text-generation", model=model_name, device_map="auto")
 
 @st.cache_resource(show_spinner=False)
 def get_embedder():
@@ -308,24 +343,83 @@ def detect_theme_keyphrase(headline: str, content: str, url: str) -> str:
     return headline_short
 
 def build_awareness_poll(headline: str, content: str, url: str) -> str:
-    keyphrase = detect_theme_keyphrase(headline, content, url)
-    if re.match(r"^(the|a|an)\b", keyphrase, flags=re.I):
-        q = f"Q: Are you aware of {keyphrase}?"
+    """Updated awareness poll to be more practice-focused"""
+    facts = extract_facts(headline, content, url)
+    drug, ind = facts["drug"], facts["indication"]
+    
+    if drug and ind:
+        q = f"Q: Were you aware of this {drug} development for {ind} before reading?"
+    elif ind:
+        keyphrase = detect_theme_keyphrase(headline, content, url)
+        q = f"Q: Were you aware of this {ind} development before reading?"
     else:
-        q = f"Q: Are you aware of the {keyphrase}?"
-    poll = q + "\n- Yes\n- No"
+        keyphrase = detect_theme_keyphrase(headline, content, url)
+        q = f"Q: Were you aware of this development before reading?"
+    
+    poll = q + "\n- Yes, was aware\n- No, new information\n- Somewhat aware\n- Will research further"
     poll = enforce_neutrality(poll)
     poll = trim_to_limit(poll, MAX_TWEET_CHARS)
     return poll
 
 # =========================
-# LLM MINER (STRICTLY GROUNDED)
+# LLM MINER - UPDATED FOR BIO MISTRAL WITH PRACTICE FOCUS
 # =========================
 class PollMiner:
     def __init__(self, model_name: str):
-        self.gen = get_text2text_pipeline(model_name)
+        self.gen_pipeline = get_text_generation_pipeline(model_name)
+        self.is_bio_mistral = "BioMistral" in model_name or "mistral" in model_name.lower()
 
-    def _prompt(self, headline: str, url: str, content: str, facts: Dict) -> str:
+    def _format_bio_mistral_prompt(self, headline: str, url: str, content: str, facts: Dict) -> str:
+        """Format prompt specifically for BioMistral with practice-focused questions"""
+        snippet = content.strip()
+        if len(snippet) > 1400:
+            snippet = snippet[:1400]
+        
+        facts_str = json.dumps({
+            "drug": facts["drug"],
+            "companies": facts["companies"][:3],
+            "indication": facts["indication"],
+            "phase": facts["phase"],
+            "topics_true": [k for k,v in facts["topics"].items() if v]
+        }, ensure_ascii=False)
+        
+        prompt = f"""<s>[INST] You are a medical content specialist creating Twitter/X poll questions about breast cancer news.
+
+TASK: Generate practice-focused Twitter/X poll questions that assess how this medical information impacts clinical practice.
+
+CRITICAL RULES:
+- Focus on PRACTICE IMPACT: information utility, practice changes, clinical application
+- Use these question frameworks:
+  * "Is this information practice-informing for [specific context]?"
+  * "Is this information practice-changing for [specific context]?" 
+  * "Will you use this information in your practice for [specific context]?"
+  * "How does this impact your clinical approach to [specific context]?"
+- Every question MUST explicitly mention specific clinical context from the facts (drug, indication, patient population, setting)
+- Use ONLY information from the provided facts and article content.
+- No invented details, no promotional language, no medical advice.
+- Each poll must be under 280 characters including the question and options.
+- Provide 3-4 concise, clinically relevant options.
+
+ARTICLE INFORMATION:
+Headline: "{headline}"
+URL: {url}
+Key Facts: {facts_str}
+
+ARTICLE CONTENT:
+{snippet}
+
+Generate several DISTINCT practice-focused poll questions. Format each poll as:
+Q: <practice-focused question with specific clinical context>
+- Option 1
+- Option 2  
+- Option 3
+- Option 4 (optional)
+
+Ensure each question assesses clinical utility and practice impact. [/INST]"""
+        return prompt
+
+    def _format_flan_prompt(self, headline: str, url: str, content: str, facts: Dict) -> str:
+        """Updated prompt format for Flan models with practice focus"""
         snippet = content.strip()
         if len(snippet) > 1400:
             snippet = snippet[:1400]
@@ -336,50 +430,89 @@ class PollMiner:
             "phase": facts["phase"],
             "topics_true": [k for k,v in facts["topics"].items() if v]
         }, ensure_ascii=False)
-        return f"""You write strictly grounded Twitter/X poll questions ONLY about this article.
+        
+        return f"""Generate practice-focused Twitter/X poll questions assessing clinical utility and practice impact.
+
+FOCUS AREAS:
+- Is this information practice-informing?
+- Is this information practice-changing?
+- Will you use this in your practice?
+- How does this impact clinical approach?
+
 RULES:
-- Every question MUST explicitly mention at least one of: drug, company, indication, mutation, phase, endpoint, or setting from the facts.
-- No invented details. No promotional language. No medical advice.
-- ≤ 280 chars including options. Provide 3–4 concise, non-leading options.
+- Every question must focus on PRACTICE IMPACT and mention specific clinical context from facts
+- Use specific clinical details: {facts_str}
+- No generic questions - always tie to specific drugs, indications, or clinical scenarios
+- ≤ 280 chars including options. Provide 3–4 clinically relevant options.
 
 Headline: "{headline}"
 URL: {url}
-Facts JSON: {facts_str}
 Article:
 \"\"\"{snippet}\"\"\"
 
-Output several DISTINCT poll blocks. Format:
-Q: <question including at least one fact>
+Output practice-focused poll blocks. Format:
+Q: <practice-impact question with specific context>
 - Option
 - Option
 - Option
 - Option (optional)
 """
 
+    def _prompt(self, headline: str, url: str, content: str, facts: Dict) -> str:
+        if self.is_bio_mistral:
+            return self._format_bio_mistral_prompt(headline, url, content, facts)
+        else:
+            return self._format_flan_prompt(headline, url, content, facts)
+
     def generate(self, headline: str, url: str, content: str, facts: Dict,
                  passes: int, temperature: float, top_p: float) -> List[str]:
         all_blocks: List[str] = []
+        
         for _ in range(passes):
-            out = self.gen(
-                self._prompt(headline, url, content, facts),
-                max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=True,
-                temperature=temperature,
-                top_p=top_p,
-                num_return_sequences=1,
-            )[0]["generated_text"]
-            blocks = parse_polls_block(out)
-            for b in blocks:
-                b = enforce_neutrality(b)
-                b = trim_to_limit(b, MAX_TWEET_CHARS)
-                all_blocks.append(b)
-        # exact dedup
+            try:
+                if self.is_bio_mistral:
+                    # BioMistral specific generation
+                    result = self.gen_pipeline(
+                        self._prompt(headline, url, content, facts),
+                        max_new_tokens=MAX_NEW_TOKENS,
+                        do_sample=True,
+                        temperature=temperature,
+                        top_p=top_p,
+                        num_return_sequences=1,
+                        pad_token_id=self.gen_pipeline.tokenizer.eos_token_id,
+                        return_full_text=False  # Don't repeat the prompt
+                    )
+                    out = result[0]["generated_text"]
+                else:
+                    # Original Flan-T5 generation
+                    result = self.gen_pipeline(
+                        self._prompt(headline, url, content, facts),
+                        max_new_tokens=MAX_NEW_TOKENS,
+                        do_sample=True,
+                        temperature=temperature,
+                        top_p=top_p,
+                        num_return_sequences=1,
+                    )
+                    out = result[0]["generated_text"]
+                
+                blocks = parse_polls_block(out)
+                for b in blocks:
+                    b = enforce_neutrality(b)
+                    b = trim_to_limit(b, MAX_TWEET_CHARS)
+                    all_blocks.append(b)
+                    
+            except Exception as e:
+                st.warning(f"Generation attempt failed: {e}")
+                continue
+
+        # Exact dedup
         uniq = list(dict.fromkeys([normalize_ws(b) for b in all_blocks]))
-        # semantic dedup
+        
+        # Semantic dedup
         embedder = get_embedder()
         uniq = dedup_semantic(uniq, similarity_dup_threshold, embedder)
 
-        # grounded filter
+        # Enhanced grounded filter with practice focus
         grounded_terms = set()
         if facts["drug"]: grounded_terms.add(str(facts["drug"]).lower())
         for c in facts["companies"]:
@@ -392,7 +525,13 @@ Q: <question including at least one fact>
 
         def is_grounded(poll: str) -> bool:
             t = poll.lower()
-            return any(term in t for term in grounded_terms)
+            # Check for specific clinical terms AND practice-focused language
+            clinical_terms_present = any(term in t for term in grounded_terms)
+            practice_focus_present = any(phrase in t for phrase in [
+                "practice", "clinical", "use this", "impact", "change", "inform", 
+                "applicable", "relevant", "approach", "discussion", "treatment"
+            ])
+            return clinical_terms_present and practice_focus_present
 
         final = []
         for blk in uniq:
@@ -409,9 +548,10 @@ Q: <question including at least one fact>
         return final
 
 # =========================
-# RULE-BASED FALLBACK
+# RULE-BASED FALLBACK - UPDATED FOR PRACTICE FOCUS
 # =========================
 def rule_based_polls(facts: Dict) -> List[str]:
+    """Generate practice-focused rule-based polls"""
     polls: List[str] = []
     def add(q, options):
         block = "Q: " + q.strip()
@@ -425,37 +565,46 @@ def rule_based_polls(facts: Dict) -> List[str]:
     companies = facts["companies"]
     tp = facts["topics"]
 
-    if tp["fda_approval"] and (drug or ind):
+    # Practice-focused questions with specific clinical context
+    if drug and ind:
         add(
-            f"Which aspect matters most to you about the FDA approval of {drug or 'this therapy'} for {ind}?",
-            ["Efficacy data", "Safety/tolerability", "Eligible population", "Access/cost"]
+            f"Is this information about {drug} for {ind} practice-changing for you?",
+            ["Yes, will change my practice", "Informative but no practice change", "Not relevant to my practice", "Need more data"]
         )
-    if tp["trial"] and (phase or drug or companies):
-        who = ""
-        if drug and companies:
-            who = f"{drug} by {companies[0]}"
-        elif drug:
-            who = f"{drug}"
-        elif companies:
-            who = f"by {companies[0]}"
         add(
-            f"In a {('phase ' + phase) if phase else 'clinical'} trial {who}, which endpoint matters most?",
-            ["Overall survival", "Progression-free survival", "Quality of life", "Response rate"]
+            f"Will you use this {drug} information in your {ind} practice?",
+            ["Yes, immediately applicable", "Yes, with certain patients", "No, not applicable", "Need guideline updates first"]
         )
-    if tp["mutation_pik3ca"] and "breast cancer" in ind.lower():
+    
+    if tp["fda_approval"] and drug:
         add(
-            "When should PIK3CA testing occur for HR+ breast cancer?",
-            ["Before first-line therapy", "After progression", "Case by case", "Not sure"]
+            f"How practice-informing is the FDA approval of {drug} for {ind}?",
+            ["Highly practice-changing", "Moderately informative", "Minimal impact", "Awaiting real-world data"]
         )
-    if (tp["setting_firstline"] or tp["fda_approval"]) and (ind or drug):
+    
+    if tp["trial"] and phase and drug:
         add(
-            f"For first-line {ind}, which factor most influences regimen selection?",
-            ["Efficacy", "Side effects", "Doctor recommendation", "Cost/access"]
+            f"Does this Phase {phase} {drug} trial data impact your clinical approach to {ind}?",
+            ["Yes, changes my thinking", "Yes, confirms current approach", "No, not convincing", "Need more follow-up"]
         )
-    if tp["setting_adjuvant"] and ("her2" in ind.lower()):
+    
+    if tp["endpoints"] and drug:
         add(
-            "In adjuvant HER2+ breast cancer, which factor feels most decisive?",
-            ["Risk reduction size", "Tolerability", "Treatment duration", "Guideline alignment"]
+            f"How will these {drug} {ind} results influence your treatment discussions?",
+            ["Significantly change discussions", "Modestly inform discussions", "No impact on discussions", "Uncertain until published"]
+        )
+    
+    if companies and drug:
+        add(
+            f"Is this {drug} development by {companies[0]} practice-relevant for your {ind} patients?",
+            ["Yes, highly relevant", "Yes, for some patients", "No, not applicable", "Depends on access/cost"]
+        )
+
+    # General practice-focused questions as fallback
+    if ind and not polls:
+        add(
+            f"How practice-changing is this {ind} information?",
+            ["Practice-changing", "Practice-informing", "Not practice-impacting", "Uncertain impact"]
         )
 
     embedder = get_embedder()
@@ -604,5 +753,5 @@ if run_btn and articles:
 st.markdown("---")
 st.caption(
     "Tip: If polls look too generic, increase passes or switch to the larger model. "
-    "Each question must mention at least one extracted fact (drug/company/indication/phase/topic)."
+    "Each question must mention at least one extracted fact (drug/company/indication/phase/topic) and focus on practice impact."
 )
