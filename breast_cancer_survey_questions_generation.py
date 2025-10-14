@@ -81,7 +81,7 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.caption("Upload a JSON list like: `[{'headline','url','content'}, ...]`")
+    st.caption("Input is a JSON list. This app now defaults to `article_summaries_extractions.json` (headline/url/summary_tweet/companies/drugs).")
 
 # Authenticate HF (if used)
 if provider == "huggingface" and hf_token:
@@ -237,7 +237,7 @@ def dedup_semantic(blocks: List[str], threshold: float, embedder) -> List[str]:
     return keep
 
 # =========================
-# ENTITY/FACT EXTRACTION (simple)
+# ENTITY/FACT EXTRACTION (updated to use provided companies/drugs)
 # =========================
 KNOWN_PHARMA = {
     "Genentech","Roche","Novartis","Pfizer","AstraZeneca","Eli Lilly","Merck",
@@ -285,27 +285,6 @@ def company_from_url(url: str) -> Optional[str]:
     except Exception:
         return None
 
-def find_companies(text: str) -> List[str]:
-    found = set()
-    for k in KNOWN_PHARMA:
-        if re.search(rf"\b{k}\b", text, flags=re.I):
-            found.add(k)
-    for m in re.finditer(rf"\b([A-Z][A-Za-z&\-]+(?:\s+[A-Z][A-Za-z&\-]+){{0,2}})(?:{ORG_SUFFIXES})?\b", text):
-        name = m.group(0).strip()
-        if len(name.split()) >= 1 and not re.match(r"^(Q|FDA|HR\+|HER2|\(?HR\+|\(?HER2|PIK3CA|Phase|Breast|Cancer|Trial|Study)$", name):
-            found.add(name)
-    out = [re.sub(r"\s+", " ", f).strip() for f in found]
-    return list({x.lower(): x for x in out}.values())
-
-def pick_drug(text: str, lower_text: str) -> Optional[str]:
-    m = re.search(r"\b([A-Z][A-Za-z0-9\-]{3,}(?:™|®))", text)
-    if m: return m.group(1)
-    m = re.search(r"\b([A-Z][A-Za-z0-9\-]{3,})\s*\(([^)]+)\)", text)
-    if m: return f"{m.group(1)} ({m.group(2)})"
-    m = re.search(r"\b(inavolisib|palbociclib|fulvestrant|trastuzumab|pertuzumab|t-?dm1|olaparib|abemaciclib|ribociclib|alpelisib|everolimus|letrozole|anastrozole|exemestane)\b", lower_text)
-    if m: return m.group(1)
-    return None
-
 def pick_indication(text: str) -> str:
     m = re.search(r"(HR\+\s*[,/]*\s*HER2-\s*.*?breast cancer|HER2\+\s*.*?breast cancer|HER2-\s*.*?breast cancer|HR\+\s*.*?breast cancer|metastatic breast cancer|early breast cancer|breast cancer)", text, flags=re.I)
     return m.group(1) if m else "breast cancer"
@@ -329,22 +308,37 @@ def detect_topics(text: str, lower_text: str) -> Dict[str, bool]:
         her2_pos=("her2+" in lower_text or "her2-positive" in lower_text),
     )
 
-def extract_facts(headline: str, content: str, url: str) -> Dict:
-    text = f"{headline or ''}\n{content or ''}"
+def extract_facts_from_inputs(
+    headline: str,
+    content_or_summary: str,
+    url: str,
+    companies_in: List[str],
+    drugs_in: List[str],
+) -> Dict:
+    """
+    Build a facts dict that uses provided companies/drugs when present,
+    and still parses indication/phase/topics from the headline/content text.
+    """
+    text = f"{headline or ''}\n{content_or_summary or ''}"
     text_norm = re.sub(r"\s+", " ", text).strip()
     t = text_norm.lower()
-    companies = find_companies(text_norm)
+
+    companies = list(companies_in or [])
     pub = company_from_url(url) or None
     if pub and pub not in companies:
         companies.insert(0, pub)
-    drug = pick_drug(text_norm, t)
+
+    # Choose a single primary drug for awareness (keep full list too)
+    drug_primary = (drugs_in[0] if drugs_in else None)
+
     indication = pick_indication(text_norm)
     phase = pick_phase(t)
     topics = detect_topics(text_norm, t)
     return dict(
         companies=companies,
         publisher=pub,
-        drug=drug,
+        drug=drug_primary,
+        drugs=drugs_in or [],
         indication=indication,
         phase=phase,
         topics=topics
@@ -353,10 +347,8 @@ def extract_facts(headline: str, content: str, url: str) -> Dict:
 # =========================
 # AWARENESS POLL
 # =========================
-def build_awareness_poll(headline: str, content: str, url: str) -> str:
-    facts = extract_facts(headline, content, url)
-    drug, ind = facts["drug"], facts["indication"]
-
+def build_awareness_poll(facts: Dict) -> str:
+    drug, ind = facts.get("drug"), facts.get("indication", "breast cancer")
     if drug and ind:
         q = f"Q: Were you aware of this {drug} development for {ind} before reading?"
     elif ind:
@@ -414,28 +406,29 @@ class PollMiner:
             self.wxa_model = None
 
     # ---------- HCP-perspective, content-bound prompt (max 4 polls) ----------
-    def _format_prompt(self, headline: str, url: str, content: str, facts: Dict) -> str:
-        snippet = content.strip()
+    def _format_prompt(self, headline: str, url: str, grounding_text: str, facts: Dict) -> str:
+        snippet = grounding_text.strip()
         if len(snippet) > 1600:
             snippet = snippet[:1600]
         facts_str = json.dumps({
-            "drug": facts["drug"],
-            "companies": facts["companies"][:3],
-            "indication": facts["indication"],
-            "phase": facts["phase"],
-            "topics_true": [k for k, v in facts["topics"].items() if v]
+            "drug": facts.get("drug"),
+            "drugs": facts.get("drugs", [])[:6],
+            "companies": facts.get("companies", [])[:6],
+            "indication": facts.get("indication"),
+            "phase": facts.get("phase"),
+            "topics_true": [k for k, v in facts.get("topics", {}).items() if v]
         }, ensure_ascii=False)
 
         return f"""
 You are an assistant that writes Twitter/X poll questions to understand a **doctor's (HCP) perspective** on ONE breast cancer news article.
 
 STRICT CONTENT RULES — READ CAREFULLY:
-- USE ONLY information that appears in the headline or article content below (or in Key Facts). Do NOT invent drugs, companies, endpoints, biomarkers, or settings.
+- USE ONLY information that appears in the headline or article content/summary below (or in Key Facts). Do NOT invent drugs, companies, endpoints, biomarkers, or settings.
 - Each poll MUST clearly reference the specific context present in the article (e.g., drug name, indication, phase/setting, relevant endpoint if mentioned).
 - Produce AT MOST **4** polls and make them mutually DISTINCT in focus (avoid paraphrases):
-  • practice impact (practice-informing vs practice-changing)  
-  • intent to use in practice  
-  • patient selection / setting (line of therapy, subtype, biomarker)  
+  • practice impact (practice-informing vs practice-changing)
+  • intent to use in practice
+  • patient selection / setting (line of therapy, subtype, biomarker)
   • endpoints / treatment discussions (e.g., PFS/OS/ORR if mentioned)
 - Keep each poll UNDER 280 characters total (question + options) and include 3–4 concise options.
 - Return COMPLETE polls only (no truncated options).
@@ -446,7 +439,7 @@ Headline: "{headline}"
 URL: {url}
 Key Facts (only for grounding; do not add new facts): {facts_str}
 
-ARTICLE CONTENT (truncated):
+ARTICLE CONTENT/SUMMARY (truncated):
 {snippet}
 
 OUTPUT FORMAT (up to 4 polls; no extra text):
@@ -457,7 +450,6 @@ Q: <HCP-perspective question that strictly reflects article content>
 - Option 4 (optional)
 """
 
-    # ----- Provider-specific calls -----
     def _gen_watsonx(self, prompt: str, temperature: float, top_p: float, max_new_tokens: int) -> str:
         if not self.wxa_model:
             raise RuntimeError("watsonx model not initialized")
@@ -521,7 +513,6 @@ Q: <HCP-perspective question that strictly reflects article content>
             stream=False,
         )
 
-    # --- uniqueness-only filtering + diversity buckets ---
     @staticmethod
     def _stem(line: str) -> str:
         s = line.lower()
@@ -547,21 +538,15 @@ Q: <HCP-perspective question that strictly reflects article content>
         return "other"
 
     def _select_diverse_top4(self, polls: List[str], embedder) -> List[str]:
-        """Pick at most one per bucket in priority order, max 4 total."""
         if not polls:
             return []
-
-        # exact de-dup
         uniq = list(dict.fromkeys([normalize_ws(p) for p in polls]))
-        # semantic de-dup
         uniq = dedup_semantic(uniq, similarity_dup_threshold, embedder)
 
-        # stem de-dup within selection loop
         priority = ["practice_impact", "intent_to_use", "patient_selection", "endpoints", "other"]
         chosen: List[str] = []
         seen_stems: List[str] = []
 
-        # bucketize
         by_bucket: Dict[str, List[str]] = {}
         for p in uniq:
             qline = p.splitlines()[0] if p else ""
@@ -574,7 +559,6 @@ Q: <HCP-perspective question that strictly reflects article content>
                 if not seen_stems:
                     chosen.append(candidate); seen_stems.append(stem)
                     break
-                # stem cosine to avoid paraphrases
                 if util.cos_sim(embedder.encode(stem), embedder.encode(seen_stems)).max().item() < 0.90:
                     chosen.append(candidate); seen_stems.append(stem)
                     break
@@ -583,7 +567,6 @@ Q: <HCP-perspective question that strictly reflects article content>
             if len(chosen) >= MAX_POLLS_PER_ARTICLE:
                 break
 
-        # If still under cap, fill with remaining unique (non-paraphrase)
         if len(chosen) < MAX_POLLS_PER_ARTICLE:
             for p in uniq:
                 if p in chosen:
@@ -596,7 +579,7 @@ Q: <HCP-perspective question that strictly reflects article content>
 
         return chosen[:MAX_POLLS_PER_ARTICLE]
 
-    def generate(self, headline: str, url: str, content: str, facts: Dict,
+    def generate(self, headline: str, url: str, grounding_text: str, facts: Dict,
                  passes: int, temperature: float, top_p: float, max_new_tokens: int) -> List[str]:
 
         ready = any([self.wxa_model, self.hf_client, self.gen_pipeline])
@@ -606,7 +589,6 @@ Q: <HCP-perspective question that strictly reflects article content>
 
         all_blocks: List[str] = []
 
-        # Per-article jitter to reduce sameness
         seed_jitter = (abs(hash(headline + url)) % 1000) / 1000.0
         jitter_temp = min(1.2, max(0.2, temperature + (seed_jitter - 0.5) * 0.15))
         jitter_top_p = min(1.0, max(0.6, top_p + (seed_jitter - 0.5) * 0.15))
@@ -614,7 +596,7 @@ Q: <HCP-perspective question that strictly reflects article content>
         for i in range(passes):
             try:
                 with st.spinner(f"Generating polls (pass {i+1}/{passes})..."):
-                    prompt = self._format_prompt(headline, url, content, facts)
+                    prompt = self._format_prompt(headline, url, grounding_text, facts)
 
                     if self.provider == "watsonx":
                         out = self._gen_watsonx(prompt, jitter_temp, jitter_top_p, max_new_tokens)
@@ -646,7 +628,6 @@ Q: <HCP-perspective question that strictly reflects article content>
                 st.warning(f"Generation attempt {i+1} failed: {e}")
                 continue
 
-        # Keep only polls that look valid
         valid = []
         for blk in all_blocks:
             lines = [ln for ln in blk.splitlines() if ln.strip()]
@@ -675,9 +656,7 @@ def rule_based_polls(facts: Dict) -> List[str]:
             block = trim_to_limit(block, MAX_TWEET_CHARS)
             polls.append(block)
 
-    drug, ind, phase = facts["drug"], facts["indication"], facts["phase"]
-    tp = facts["topics"]
-
+    drug, ind = facts.get("drug"), facts.get("indication")
     if drug and ind:
         add(
             f"Is this information about {drug} for {ind} practice-changing for you?",
@@ -701,9 +680,27 @@ def rule_based_polls(facts: Dict) -> List[str]:
 # =========================
 # PIPELINE (one article)
 # =========================
-def build_polls_for_article(headline: str, url: str, content: str):
-    facts = extract_facts(headline, content, url)
-    awareness = build_awareness_poll(headline, content, url)
+def build_polls_for_article(art: Dict):
+    # Input may contain: headline, url, content?, summary_tweet?, companies?, drugs?
+    headline = (art.get("headline") or "").strip()
+    url = (art.get("url") or "").strip()
+    content = (art.get("content") or "").strip()
+    summary_tweet = (art.get("summary_tweet") or "").strip()
+    companies_in = art.get("companies") or []
+    drugs_in = art.get("drugs") or []
+
+    # Grounding text prefers full content, else the summary tweet + headline.
+    grounding_text = content if content else (headline + "\n\n" + summary_tweet)
+
+    facts = extract_facts_from_inputs(
+        headline=headline,
+        content_or_summary=grounding_text,
+        url=url,
+        companies_in=companies_in,
+        drugs_in=drugs_in,
+    )
+
+    awareness = build_awareness_poll(facts)
 
     miner = PollMiner(
         model_name, provider, use_hf_inference,
@@ -713,8 +710,10 @@ def build_polls_for_article(headline: str, url: str, content: str):
         wxa_project_or_space if provider == "watsonx" else None
     )
 
-    llm_polls = miner.generate(headline, url, content, facts,
-                               passes_per_article, temperature, top_p, max_new_tokens)
+    llm_polls = miner.generate(
+        headline, url, grounding_text, facts,
+        passes_per_article, temperature, top_p, max_new_tokens
+    )
 
     if not llm_polls and allow_rule_fallback:
         llm_polls = rule_based_polls(facts)
@@ -722,11 +721,9 @@ def build_polls_for_article(headline: str, url: str, content: str):
     # Combine with awareness and cap to MAX_POLLS_PER_ARTICLE with diversity
     embedder = get_embedder()
     all_polls = [awareness] + llm_polls
-    # exact dedup -> semantic -> stem diversity
     all_polls = list(dict.fromkeys([normalize_ws(p) for p in all_polls]))
     all_polls = dedup_semantic(all_polls, max(similarity_dup_threshold, 0.93), embedder)
 
-    # simple stem dedup and cap
     stems = []
     final = []
     for p in all_polls:
@@ -738,14 +735,14 @@ def build_polls_for_article(headline: str, url: str, content: str):
         if util.cos_sim(embedder.encode(stem), embedder.encode(stems)).max().item() < 0.90:
             final.append(p); stems.append(stem)
 
-    return final, facts
+    return final, facts, grounding_text, summary_tweet, companies_in, drugs_in
 
 # =========================
 # FILE INPUTS
 # =========================
 st.header("📰 Breast Cancer News → 🗳️ Poll Generator")
 
-uploaded = st.file_uploader("Upload JSON (list of objects with 'headline','url','content')", type=["json"])
+uploaded = st.file_uploader("Upload JSON", type=["json"])
 
 APP_DIR = Path(__file__).parent.resolve()
 repo_files: List[Path] = sorted([p for p in APP_DIR.glob("*.json") if p.is_file()])
@@ -779,7 +776,9 @@ if run_btn:
             else:
                 articles = load_json_any(p)
         else:
+            # Default now prefers article_summaries_extractions.json
             guesses = [
+                APP_DIR / "article_summaries_extractions.json",
                 APP_DIR / "twitter_polls_generated_v3.json",
                 APP_DIR / "breast_cancer_news_content.json",
             ]
@@ -809,37 +808,47 @@ if run_btn and articles:
     else:
         with st.spinner("Generating polls…"):
             for idx, art in enumerate(articles, start=1):
-                headline = (art.get("headline") or "").strip()
-                url = (art.get("url") or "").strip()
-                content = (art.get("content") or "").strip()
                 try:
-                    polls, facts = build_polls_for_article(headline, url, content)
+                    polls, facts, grounding_text, summary_tweet, companies_in, drugs_in = build_polls_for_article(art)
                 except Exception as e:
+                    headline = (art.get("headline") or "").strip()
                     st.error(f"#{idx} {headline or '(no headline)'}: {e}")
                     continue
 
-                # ---- Optional comment input per article ----
+                headline = (art.get("headline") or "").strip()
+                url = (art.get("url") or "").strip()
+
                 comment_key = f"comment-{idx}"
                 st.session_state.setdefault(comment_key, "")
                 with st.expander(f"#{idx}  {headline or '(no headline)'}", expanded=False):
                     if url:
                         st.markdown(f"**Source:** [{url}]({url})")
+
+                    # Column block
                     col1, col2, col3 = st.columns([1.2, 1, 1])
                     with col1:
-                        st.markdown("**Indication:** " + (facts["indication"] or "—"))
-                        st.markdown("**Drug:** " + (facts["drug"] or "—"))
-                        st.markdown("**Phase:** " + (facts["phase"] or "—"))
+                        # Drugs (list) from input
+                        st.markdown("**Drugs/Products:** " + (", ".join(drugs_in) if drugs_in else (facts.get("drug") or "—")))
+                        st.markdown("**Indication:** " + (facts.get("indication") or "—"))
+                        st.markdown("**Phase:** " + (facts.get("phase") or "—"))
                     with col2:
-                        st.markdown("**Publisher:** " + (facts["publisher"] or "—"))
-                        st.markdown("**Companies:** " + (", ".join(facts["companies"]) or "—"))
+                        st.markdown("**Publisher:** " + (facts.get("publisher") or "—"))
+                        # Companies from input
+                        st.markdown("**Companies:** " + (", ".join(companies_in) if companies_in else (", ".join(facts.get("companies", [])) or "—")))
                     with col3:
-                        ts = [k for k, v in facts["topics"].items() if v]
+                        ts = [k for k, v in facts.get("topics", {}).items() if v]
                         st.markdown("**Topics:** " + (", ".join(ts) if ts else "—"))
-                    if content:
-                        preview = content.strip()
+
+                    # Show summary_tweet if present (preferred preview)
+                    if summary_tweet:
+                        st.markdown("**Summary (tweet):**")
+                        st.markdown("> " + summary_tweet.replace("\n", " "))
+                    elif grounding_text:
+                        preview = grounding_text.strip()
                         if len(preview) > 600:
                             preview = preview[:600] + "…"
                         st.markdown("> " + preview.replace("\n", " "))
+
                     st.markdown("---")
                     st.subheader("Generated Polls (max 4)")
                     if not polls:
@@ -855,15 +864,18 @@ if run_btn and articles:
                                 st.markdown(f"**Q{i}. {q}**")
                                 st.radio(label=" ", options=opts or ["(no options)"], index=None, key=f"{idx}-{i}", disabled=True)
                             st.markdown("")
+
                     st.markdown("---")
                     st.text_area("Optional HCP comment (will be exported)", key=comment_key, height=100)
 
-                # add to results including comment
                 results.append({
                     "headline": headline,
                     "url": url,
                     "polls": polls,
-                    "comment": st.session_state.get(comment_key, "")
+                    "comment": st.session_state.get(comment_key, ""),
+                    "companies": companies_in,
+                    "drugs": drugs_in,
+                    "summary_tweet": summary_tweet
                 })
 
         st.markdown("---")
@@ -878,6 +890,7 @@ if run_btn and articles:
 
 st.markdown("---")
 st.caption(
+    "Input now supports summarized articles (headline/url/summary_tweet/companies/drugs). "
     "If polls look truncated, raise 'Max new tokens per pass'. "
     "For watsonx, provide API key, instance URL, and Project/Space ID. "
     "For HF, ensure your token allows 'Make calls to Inference Providers'."
