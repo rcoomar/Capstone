@@ -3,7 +3,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import List, Dict, Optional, Set, Tuple
+from typing import List, Dict, Optional
 from urllib.parse import urlparse
 
 import numpy as np
@@ -22,7 +22,33 @@ MAX_TWEET_CHARS = 280
 MAX_POLL_OPTIONS = 4
 MAX_POLLS_PER_ARTICLE = 4  # <-- hard cap (includes awareness, if present)
 
+# Lock to server-side creds by default
+USE_WATSONX_SECRETS = True   # read watsonx creds from st.secrets/env; never ask user
+DEFAULT_PROVIDER = "watsonx"
+DEFAULT_MODEL = LLAMA_MODEL
+
 st.set_page_config(page_title="Breast Cancer News → Poll Generator", layout="wide")
+
+# =========================
+# Secrets / Env helpers
+# =========================
+def get_watsonx_creds():
+    """
+    Pull watsonx creds from Streamlit secrets, falling back to env vars.
+    Returns: (api_key, url, space_or_project_id_str)
+    """
+    api_key = st.secrets.get("WATSONX_API_KEY") or os.getenv("WATSONX_API_KEY", "")
+    url = st.secrets.get("WATSONX_URL") or os.getenv("WATSONX_URL", "https://us-south.ml.cloud.ibm.com")
+    space_id = st.secrets.get("WATSONX_SPACE_ID") or os.getenv("WATSONX_SPACE_ID", "")
+    proj_id  = st.secrets.get("WATSONX_PROJECT_ID") or os.getenv("WATSONX_PROJECT_ID", "")
+    space_or_project = space_id or proj_id
+    return api_key, url, space_or_project
+
+def get_hf_token():
+    """
+    Optional HF token if you want to use Hugging Face Inference.
+    """
+    return st.secrets.get("HF_TOKEN") or os.getenv("HF_TOKEN", "")
 
 # =========================
 # SIDEBAR / SETTINGS
@@ -30,34 +56,33 @@ st.set_page_config(page_title="Breast Cancer News → Poll Generator", layout="w
 with st.sidebar:
     st.title("⚙️ Settings")
 
+    # You can allow the user to switch providers; no keys are asked for.
     provider = st.selectbox(
         "Provider",
         ["watsonx", "huggingface"],
-        index=0,
-        help="Pick the platform to call the model."
+        index=0 if DEFAULT_PROVIDER == "watsonx" else 1,
+        help="Pick the platform to call the model.",
     )
 
     model_name = st.selectbox(
         "Model",
         [LLAMA_MODEL, MISTRAL_MODEL],
-        index=0,
-        help="Llama 3.3 70B Instruct (watsonx chat_model) or Mistral 7B Instruct."
+        index=0 if DEFAULT_MODEL == LLAMA_MODEL else 1,
+        help="Llama 3.3 70B Instruct (watsonx chat_model) or Mistral 7B Instruct.",
     )
 
     if provider == "watsonx":
-        wxa_api_key = st.text_input("watsonx API key", type="password")
-        wxa_url = st.text_input("watsonx URL", value="https://us-south.ml.cloud.ibm.com")
-        wxa_project_or_space = st.text_input(
-            "watsonx Project ID (or Space ID)",
-            help="If a Space, you can enter either the raw space id or 'space:<id>'."
-        )
+        # No key inputs—pull from secrets/env
+        wxa_api_key, wxa_url, wxa_project_or_space = get_watsonx_creds()
+        st.caption("Using server-side watsonx credentials (Streamlit secrets / env).")
         use_hf_inference = False
         hf_token = None
     else:
-        default_token = st.secrets.get("HF_TOKEN", "")
-        hf_token = st.text_input("Hugging Face token", value=default_token, type="password",
-                                 help="Fine-grained token with 'Make calls to Inference Providers'.")
+        # Optional: Hugging Face Inference without asking users for token
+        hf_token = get_hf_token()
         use_hf_inference = st.toggle("Use HF Inference API (recommended)", value=True)
+        if not hf_token:
+            st.warning("No HF_TOKEN found in secrets/env. Hugging Face calls will fail without it.")
 
     passes_per_article = st.slider("Generation passes per article", 1, 6, 3)
     temperature = st.slider("Temperature (creativity)", 0.0, 1.2, 0.8, 0.1)
@@ -66,24 +91,24 @@ with st.sidebar:
     max_new_tokens = st.slider(
         "Max new tokens per pass",
         min_value=128, max_value=1024, value=480, step=32,
-        help="Raise this if polls are getting cut off mid-sentence."
+        help="Raise this if polls are getting cut off mid-sentence.",
     )
 
     similarity_dup_threshold = st.slider(
         "Uniqueness threshold (semantic de-dup)", 0.85, 0.99, 0.95, 0.01,
-        help="Higher = only keep very distinct polls (per article)."
+        help="Higher = only keep very distinct polls (per article).",
     )
 
     allow_rule_fallback = st.toggle(
         "Allow rule-based fallback if LLM fails",
         value=False,
-        help="Turn ON only if you're okay with generic polls when the model is unavailable."
+        help="Turn ON only if you're okay with generic polls when the model is unavailable.",
     )
 
     st.markdown("---")
-    st.caption("Input is a JSON list. This app now defaults to `article_summaries_extractions.json` (headline/url/summary_tweet/companies/drugs).")
+    st.caption("Input defaults to `article_summaries_extractions.json` (headline/url/summary_tweet/companies/drugs).")
 
-# Authenticate HF (if used)
+# Authenticate HF (server-side only; no user prompt)
 if provider == "huggingface" and hf_token:
     try:
         hf_login(token=hf_token)
@@ -119,7 +144,7 @@ def get_local_mistral_pipeline(_model_name: str, token: Optional[str]):
         tokenizer=tok,
         torch_dtype=dtype,
         device=0 if cuda else -1,
-        trust_remote_code=True
+        trust_remote_code=True,
     )
     return pipe
 
@@ -151,7 +176,7 @@ def get_watsonx_model(model_id: str, api_key: str, url: str, project_or_space_id
 # =========================
 AVOID_PHRASES = [
     r"\bbreakthrough\b", r"\bmiracle\b", r"\bgame[- ]?changing\b",
-    r"\bcure\b", r"\bguarantee(d)?\b", r"\bperfect\b", r"\bmust[- ]?have\b"
+    r"\bcure\b", r"\bguarantee(d)?\b", r"\bperfect\b", r"\bmust[- ]?have\b",
 ]
 
 def normalize_ws(s: str) -> str:
@@ -237,12 +262,12 @@ def dedup_semantic(blocks: List[str], threshold: float, embedder) -> List[str]:
     return keep
 
 # =========================
-# ENTITY/FACT EXTRACTION (updated to use provided companies/drugs)
+# ENTITY/FACT EXTRACTION (uses provided companies/drugs if present)
 # =========================
 KNOWN_PHARMA = {
     "Genentech","Roche","Novartis","Pfizer","AstraZeneca","Eli Lilly","Merck",
     "Sanofi","Gilead","BMS","Amgen","GSK","Bayer","Takeda","Boehringer Ingelheim",
-    "BeiGene","Seagen","Roche Genentech","Sermonix Pharma","Sermonix"
+    "BeiGene","Seagen","Roche Genentech","Sermonix Pharma","Sermonix",
 }
 ORG_SUFFIXES = r"(?: Inc\.?| Corp\.?| Corporation| Ltd\.?| LLC| plc| AG| SA| NV| Co\.?)"
 
@@ -341,7 +366,7 @@ def extract_facts_from_inputs(
         drugs=drugs_in or [],
         indication=indication,
         phase=phase,
-        topics=topics
+        topics=topics,
     )
 
 # =========================
@@ -405,7 +430,6 @@ class PollMiner:
             self.gen_pipeline = None
             self.wxa_model = None
 
-    # ---------- HCP-perspective, content-bound prompt (max 4 polls) ----------
     def _format_prompt(self, headline: str, url: str, grounding_text: str, facts: Dict) -> str:
         snippet = grounding_text.strip()
         if len(snippet) > 1600:
@@ -416,7 +440,7 @@ class PollMiner:
             "companies": facts.get("companies", [])[:6],
             "indication": facts.get("indication"),
             "phase": facts.get("phase"),
-            "topics_true": [k for k, v in facts.get("topics", {}).items() if v]
+            "topics_true": [k for k, v in facts.get("topics", {}).items() if v],
         }, ensure_ascii=False)
 
         return f"""
@@ -660,19 +684,19 @@ def rule_based_polls(facts: Dict) -> List[str]:
     if drug and ind:
         add(
             f"Is this information about {drug} for {ind} practice-changing for you?",
-            ["Practice-changing", "Practice-informing", "No impact", "Need more data"]
+            ["Practice-changing", "Practice-informing", "No impact", "Need more data"],
         )
         add(
             f"Will you use {drug} for {ind} in your practice?",
-            ["Yes, broadly", "Yes, select patients", "Not now", "Awaiting guidelines"]
+            ["Yes, broadly", "Yes, select patients", "Not now", "Awaiting guidelines"],
         )
         add(
             f"For which {ind} patients would you consider {drug}?",
-            ["First-line", "Later-line", "Specific biomarker", "Not applicable"]
+            ["First-line", "Later-line", "Specific biomarker", "Not applicable"],
         )
         add(
             f"Do these results change your treatment discussions?",
-            ["Significantly", "Somewhat", "Not really", "Unsure"]
+            ["Significantly", "Somewhat", "Not really", "Unsure"],
         )
 
     return polls[:MAX_POLLS_PER_ARTICLE]
@@ -680,7 +704,7 @@ def rule_based_polls(facts: Dict) -> List[str]:
 # =========================
 # PIPELINE (one article)
 # =========================
-def build_polls_for_article(art: Dict):
+def extract_facts_from_article(art: Dict):
     # Input may contain: headline, url, content?, summary_tweet?, companies?, drugs?
     headline = (art.get("headline") or "").strip()
     url = (art.get("url") or "").strip()
@@ -689,7 +713,6 @@ def build_polls_for_article(art: Dict):
     companies_in = art.get("companies") or []
     drugs_in = art.get("drugs") or []
 
-    # Grounding text prefers full content, else the summary tweet + headline.
     grounding_text = content if content else (headline + "\n\n" + summary_tweet)
 
     facts = extract_facts_from_inputs(
@@ -699,16 +722,27 @@ def build_polls_for_article(art: Dict):
         companies_in=companies_in,
         drugs_in=drugs_in,
     )
+    return headline, url, grounding_text, summary_tweet, companies_in, drugs_in, facts
+
+def build_polls_for_article(art: Dict):
+    headline, url, grounding_text, summary_tweet, companies_in, drugs_in, facts = extract_facts_from_article(art)
 
     awareness = build_awareness_poll(facts)
 
-    miner = PollMiner(
-        model_name, provider, use_hf_inference,
-        hf_token,
-        wxa_api_key if provider == "watsonx" else None,
-        wxa_url if provider == "watsonx" else None,
-        wxa_project_or_space if provider == "watsonx" else None
-    )
+    # Pull creds already loaded above based on provider choice
+    if provider == "watsonx":
+        wxa_api_key, wxa_url, wxa_project_or_space = get_watsonx_creds()
+        miner = PollMiner(
+            model_name, provider, False,
+            None,
+            wxa_api_key, wxa_url, wxa_project_or_space
+        )
+    else:
+        miner = PollMiner(
+            model_name, provider, True,
+            get_hf_token(),
+            None, None, None
+        )
 
     llm_polls = miner.generate(
         headline, url, grounding_text, facts,
@@ -718,7 +752,6 @@ def build_polls_for_article(art: Dict):
     if not llm_polls and allow_rule_fallback:
         llm_polls = rule_based_polls(facts)
 
-    # Combine with awareness and cap to MAX_POLLS_PER_ARTICLE with diversity
     embedder = get_embedder()
     all_polls = [awareness] + llm_polls
     all_polls = list(dict.fromkeys([normalize_ws(p) for p in all_polls]))
@@ -735,7 +768,7 @@ def build_polls_for_article(art: Dict):
         if util.cos_sim(embedder.encode(stem), embedder.encode(stems)).max().item() < 0.90:
             final.append(p); stems.append(stem)
 
-    return final, facts, grounding_text, summary_tweet, companies_in, drugs_in
+    return final, facts, grounding_text, summary_tweet, companies_in, drugs_in, headline, url
 
 # =========================
 # FILE INPUTS
@@ -801,97 +834,166 @@ if run_btn:
 # =========================
 results = []
 if run_btn and articles:
-    if provider == "huggingface" and use_hf_inference and not hf_token:
-        st.error("You selected HF Inference API but no token is set.")
-    elif provider == "watsonx" and not (wxa_api_key and wxa_url and wxa_project_or_space):
-        st.error("watsonx selected but credentials are missing.")
+    # Validation (no key prompts in UI anymore)
+    if provider == "huggingface" and use_hf_inference and not get_hf_token():
+        st.error("Hugging Face selected but HF_TOKEN is missing from secrets/env.")
+    elif provider == "watsonx":
+        _api, _url, _sp = get_watsonx_creds()
+        if not (_api and _url and _sp):
+            st.error("watsonx selected but server-side credentials are missing (WATSONX_API_KEY/URL and Space or Project ID).")
+        else:
+            with st.spinner("Generating polls…"):
+                for idx, art in enumerate(articles, start=1):
+                    try:
+                        polls, facts, grounding_text, summary_tweet, companies_in, drugs_in, headline, url = build_polls_for_article(art)
+                    except Exception as e:
+                        headline = (art.get("headline") or "").strip()
+                        st.error(f"#{idx} {headline or '(no headline)'}: {e}")
+                        continue
+
+                    comment_key = f"comment-{idx}"
+                    st.session_state.setdefault(comment_key, "")
+                    with st.expander(f"#{idx}  {headline or '(no headline)'}", expanded=False):
+                        if url:
+                            st.markdown(f"**Source:** [{url}]({url})")
+
+                        col1, col2, col3 = st.columns([1.2, 1, 1])
+                        with col1:
+                            st.markdown("**Drugs/Products:** " + (", ".join(drugs_in) if drugs_in else (facts.get("drug") or "—")))
+                            st.markdown("**Indication:** " + (facts.get("indication") or "—"))
+                            st.markdown("**Phase:** " + (facts.get("phase") or "—"))
+                        with col2:
+                            st.markdown("**Publisher:** " + (facts.get("publisher") or "—"))
+                            st.markdown("**Companies:** " + (", ".join(companies_in) if companies_in else (", ".join(facts.get("companies", [])) or "—")))
+                        with col3:
+                            ts = [k for k, v in facts.get("topics", {}).items() if v]
+                            st.markdown("**Topics:** " + (", ".join(ts) if ts else "—"))
+
+                        if summary_tweet:
+                            st.markdown("**Summary (tweet):**")
+                            st.markdown("> " + summary_tweet.replace("\n", " "))
+                        elif grounding_text:
+                            preview = grounding_text.strip()
+                            if len(preview) > 600:
+                                preview = preview[:600] + "…"
+                            st.markdown("> " + preview.replace("\n", " "))
+
+                        st.markdown("---")
+                        st.subheader("Generated Polls (max 4)")
+                        if not polls:
+                            st.info("No unique polls were generated for this article.")
+                        else:
+                            for i, poll in enumerate(polls, start=1):
+                                lines = [ln for ln in poll.splitlines() if ln.strip()]
+                                if not lines:
+                                    continue
+                                q = lines[0].replace("Q:", "").strip()
+                                opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
+                                with st.container():
+                                    st.markdown(f"**Q{i}. {q}**")
+                                    st.radio(label=" ", options=opts or ["(no options)"], index=None, key=f"{idx}-{i}", disabled=True)
+                                st.markdown("")
+
+                        st.markdown("---")
+                        st.text_area("Optional HCP comment (will be exported)", key=comment_key, height=100)
+
+                    results.append({
+                        "headline": headline,
+                        "url": url,
+                        "polls": polls,
+                        "comment": st.session_state.get(comment_key, ""),
+                        "companies": companies_in,
+                        "drugs": drugs_in,
+                        "summary_tweet": summary_tweet,
+                    })
+
+            st.markdown("---")
+            st.subheader("⬇️ Download")
+            out_json = json.dumps(results, ensure_ascii=False, indent=2)
+            st.download_button(
+                "Download results as JSON",
+                data=out_json.encode("utf-8"),
+                file_name="twitter_polls_generated.json",
+                mime="application/json",
+            )
     else:
-        with st.spinner("Generating polls…"):
-            for idx, art in enumerate(articles, start=1):
-                try:
-                    polls, facts, grounding_text, summary_tweet, companies_in, drugs_in = build_polls_for_article(art)
-                except Exception as e:
-                    headline = (art.get("headline") or "").strip()
-                    st.error(f"#{idx} {headline or '(no headline)'}: {e}")
-                    continue
+        # Hugging Face path (if selected and token exists)
+        if provider == "huggingface" and get_hf_token():
+            with st.spinner("Generating polls…"):
+                for idx, art in enumerate(articles, start=1):
+                    try:
+                        polls, facts, grounding_text, summary_tweet, companies_in, drugs_in, headline, url = build_polls_for_article(art)
+                    except Exception as e:
+                        headline = (art.get("headline") or "").strip()
+                        st.error(f"#{idx} {headline or '(no headline)'}: {e}")
+                        continue
 
-                headline = (art.get("headline") or "").strip()
-                url = (art.get("url") or "").strip()
+                    comment_key = f"comment-{idx}"
+                    st.session_state.setdefault(comment_key, "")
+                    with st.expander(f"#{idx}  {headline or '(no headline)'}", expanded=False):
+                        if url:
+                            st.markdown(f"**Source:** [{url}]({url})")
+                        col1, col2, col3 = st.columns([1.2, 1, 1])
+                        with col1:
+                            st.markdown("**Drugs/Products:** " + (", ".join(drugs_in) if drugs_in else (facts.get("drug") or "—")))
+                            st.markdown("**Indication:** " + (facts.get("indication") or "—"))
+                            st.markdown("**Phase:** " + (facts.get("phase") or "—"))
+                        with col2:
+                            st.markdown("**Publisher:** " + (facts.get("publisher") or "—"))
+                            st.markdown("**Companies:** " + (", ".join(companies_in) if companies_in else (", ".join(facts.get("companies", [])) or "—")))
+                        with col3:
+                            ts = [k for k, v in facts.get("topics", {}).items() if v]
+                            st.markdown("**Topics:** " + (", ".join(ts) if ts else "—"))
+                        if summary_tweet:
+                            st.markdown("**Summary (tweet):**")
+                            st.markdown("> " + summary_tweet.replace("\n", " "))
+                        elif grounding_text:
+                            preview = grounding_text.strip()
+                            if len(preview) > 600:
+                                preview = preview[:600] + "…"
+                            st.markdown("> " + preview.replace("\n", " "))
 
-                comment_key = f"comment-{idx}"
-                st.session_state.setdefault(comment_key, "")
-                with st.expander(f"#{idx}  {headline or '(no headline)'}", expanded=False):
-                    if url:
-                        st.markdown(f"**Source:** [{url}]({url})")
+                        st.markdown("---")
+                        st.subheader("Generated Polls (max 4)")
+                        if not polls:
+                            st.info("No unique polls were generated for this article.")
+                        else:
+                            for i, poll in enumerate(polls, start=1):
+                                lines = [ln for ln in poll.splitlines() if ln.strip()]
+                                if not lines:
+                                    continue
+                                q = lines[0].replace("Q:", "").strip()
+                                opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
+                                with st.container():
+                                    st.markdown(f"**Q{i}. {q}**")
+                                    st.radio(label=" ", options=opts or ["(no options)"], index=None, key=f"{idx}-{i}", disabled=True)
+                                st.markdown("")
+                        st.markdown("---")
+                        st.text_area("Optional HCP comment (will be exported)", key=comment_key, height=100)
 
-                    # Column block
-                    col1, col2, col3 = st.columns([1.2, 1, 1])
-                    with col1:
-                        # Drugs (list) from input
-                        st.markdown("**Drugs/Products:** " + (", ".join(drugs_in) if drugs_in else (facts.get("drug") or "—")))
-                        st.markdown("**Indication:** " + (facts.get("indication") or "—"))
-                        st.markdown("**Phase:** " + (facts.get("phase") or "—"))
-                    with col2:
-                        st.markdown("**Publisher:** " + (facts.get("publisher") or "—"))
-                        # Companies from input
-                        st.markdown("**Companies:** " + (", ".join(companies_in) if companies_in else (", ".join(facts.get("companies", [])) or "—")))
-                    with col3:
-                        ts = [k for k, v in facts.get("topics", {}).items() if v]
-                        st.markdown("**Topics:** " + (", ".join(ts) if ts else "—"))
+                    results.append({
+                        "headline": headline,
+                        "url": url,
+                        "polls": polls,
+                        "comment": st.session_state.get(comment_key, ""),
+                        "companies": companies_in,
+                        "drugs": drugs_in,
+                        "summary_tweet": summary_tweet,
+                    })
 
-                    # Show summary_tweet if present (preferred preview)
-                    if summary_tweet:
-                        st.markdown("**Summary (tweet):**")
-                        st.markdown("> " + summary_tweet.replace("\n", " "))
-                    elif grounding_text:
-                        preview = grounding_text.strip()
-                        if len(preview) > 600:
-                            preview = preview[:600] + "…"
-                        st.markdown("> " + preview.replace("\n", " "))
-
-                    st.markdown("---")
-                    st.subheader("Generated Polls (max 4)")
-                    if not polls:
-                        st.info("No unique polls were generated for this article.")
-                    else:
-                        for i, poll in enumerate(polls, start=1):
-                            lines = [ln for ln in poll.splitlines() if ln.strip()]
-                            if not lines:
-                                continue
-                            q = lines[0].replace("Q:", "").strip()
-                            opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
-                            with st.container():
-                                st.markdown(f"**Q{i}. {q}**")
-                                st.radio(label=" ", options=opts or ["(no options)"], index=None, key=f"{idx}-{i}", disabled=True)
-                            st.markdown("")
-
-                    st.markdown("---")
-                    st.text_area("Optional HCP comment (will be exported)", key=comment_key, height=100)
-
-                results.append({
-                    "headline": headline,
-                    "url": url,
-                    "polls": polls,
-                    "comment": st.session_state.get(comment_key, ""),
-                    "companies": companies_in,
-                    "drugs": drugs_in,
-                    "summary_tweet": summary_tweet
-                })
-
-        st.markdown("---")
-        st.subheader("⬇️ Download")
-        out_json = json.dumps(results, ensure_ascii=False, indent=2)
-        st.download_button(
-            "Download results as JSON",
-            data=out_json.encode("utf-8"),
-            file_name="twitter_polls_generated.json",
-            mime="application/json"
-        )
+            st.markdown("---")
+            st.subheader("⬇️ Download")
+            out_json = json.dumps(results, ensure_ascii=False, indent=2)
+            st.download_button(
+                "Download results as JSON",
+                data=out_json.encode("utf-8"),
+                file_name="twitter_polls_generated.json",
+                mime="application/json",
+            )
 
 st.markdown("---")
 st.caption(
-    "Input now supports summarized articles (headline/url/summary_tweet/companies/drugs). "
+    "Using server-side credentials via Streamlit secrets/env. "
     "If polls look truncated, raise 'Max new tokens per pass'. "
-    "For watsonx, provide API key, instance URL, and Project/Space ID. "
-    "For HF, ensure your token allows 'Make calls to Inference Providers'."
+    "Default input: article_summaries_extractions.json."
 )
