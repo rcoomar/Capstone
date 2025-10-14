@@ -8,12 +8,10 @@ from urllib.parse import urlparse
 
 import numpy as np
 import streamlit as st
-
-# HF / Transformers
-from huggingface_hub import login, InferenceClient
-from transformers import pipeline, AutoTokenizer
 import torch
 
+from huggingface_hub import login, InferenceClient
+from transformers import pipeline, AutoTokenizer
 from sentence_transformers import SentenceTransformer, util
 
 # =========================
@@ -32,29 +30,28 @@ st.set_page_config(page_title="Breast Cancer News → Poll Generator", layout="w
 with st.sidebar:
     st.title("⚙️ Settings")
 
-    # Token from secrets or UI
+    # HF token from secrets or UI
     default_token = st.secrets.get("HF_TOKEN", "")
     hf_token = st.text_input(
         "Hugging Face token",
         value=default_token,
         type="password",
-        help="Create at https://huggingface.co/settings/tokens and enable Inference API if you use it."
-    )
-    use_hf_inference = st.toggle(
-        "Use HF Inference API for Mistral (recommended)",
-        value=True,
-        help="If ON, Mistral runs via Hugging Face Inference API using your token. If OFF, it attempts local loading."
+        help="Create at https://huggingface.co/settings/tokens and enable Inference API."
     )
 
+    # choose inference vs local
+    use_hf_inference = st.toggle(
+        "Use HF Inference API (recommended)",
+        value=True,
+        help="If ON, Mistral runs via HF Inference API with your token. If OFF, load locally (big GPU needed)."
+    )
+
+    # fixed to mistral to avoid FLAN fallback
     model_name = st.selectbox(
-        "LLM Model:",
-        [
-            "mistralai/Mistral-7B-Instruct-v0.2",
-            "google/flan-t5-base",
-            "google/flan-t5-large",
-        ],
+        "LLM Model (Mistral only in this build):",
+        [DEFAULT_MODEL_NAME],
         index=0,
-        help="Use Inference API for Mistral unless you have a big GPU."
+        help="This app targets Mistral-7B-Instruct. Switch OFF API to try local loading."
     )
 
     passes_per_article = st.slider("Generation passes per article", 1, 6, 3)
@@ -67,11 +64,11 @@ with st.sidebar:
     st.markdown("---")
     st.caption("Upload a JSON list like: `[{'headline','url','content'}, ...]`")
 
-# If token entered, log in (safe to run multiple times; it’s idempotent)
+# authenticate (idempotent)
 if hf_token:
     try:
         login(token=hf_token)
-        os.environ["HUGGINGFACEHUB_API_TOKEN"] = hf_token  # for libs that read env only
+        os.environ["HUGGINGFACEHUB_API_TOKEN"] = hf_token
     except Exception as e:
         st.warning(f"Could not authenticate to Hugging Face: {e}")
 
@@ -86,45 +83,32 @@ def get_embedder():
 def get_hf_inference_client(model_id: str, token: Optional[str]):
     if not token:
         raise RuntimeError("No HF token provided for Inference API.")
-    return InferenceClient(model=model_id, token=token, timeout=90)
+    return InferenceClient(model=model_id, token=token, timeout=120)
 
 @st.cache_resource(show_spinner=False)
 def get_local_pipeline(_model_name: str, token: Optional[str]):
     """
-    Safer local loading:
-      - Avoid device_map='auto' on CPU-only machines
-      - Only try fp16 if CUDA available
+    Local loading for Mistral (GPU strongly recommended).
     """
     is_mistral = "mistral" in _model_name.lower()
+    if not is_mistral:
+        raise RuntimeError("Local mode in this build only supports Mistral.")
     cuda = torch.cuda.is_available()
-
-    if is_mistral:
-        st.info("🔧 Loading Mistral locally. This requires a large GPU (≥14 GB). "
-                "If you hit OOM, switch to the HF Inference API in the sidebar.")
-        # Mistral is a causal LM
-        dtype = torch.float16 if cuda else torch.float32
-        tok = AutoTokenizer.from_pretrained(_model_name, token=token, trust_remote_code=True)
-        pipe = pipeline(
-            task="text-generation",
-            model=_model_name,
-            tokenizer=tok,
-            torch_dtype=dtype,
-            device=0 if cuda else -1,
-            trust_remote_code=True
-        )
-        return pipe, True
-
-    # Flan models: text2text
+    st.info("🔧 Loading Mistral locally. You need a large GPU (≈14GB+ VRAM).")
+    dtype = torch.float16 if cuda else torch.float32
+    tok = AutoTokenizer.from_pretrained(_model_name, token=token, trust_remote_code=True)
     pipe = pipeline(
-        task="text2text-generation",
+        task="text-generation",
         model=_model_name,
-        tokenizer=AutoTokenizer.from_pretrained(_model_name, token=token),
-        device=0 if torch.cuda.is_available() else -1
+        tokenizer=tok,
+        torch_dtype=dtype,
+        device=0 if cuda else -1,
+        trust_remote_code=True
     )
-    return pipe, False
+    return pipe
 
 # =========================
-# TEXT HELPERS (unchanged)
+# TEXT HELPERS
 # =========================
 AVOID_PHRASES = [
     r"\bbreakthrough\b", r"\bmiracle\b", r"\bgame[- ]?changing\b",
@@ -214,7 +198,7 @@ def dedup_semantic(blocks: List[str], threshold: float, embedder) -> List[str]:
     return keep
 
 # =========================
-# ENTITY/FACT EXTRACTION (unchanged)
+# ENTITY/FACT EXTRACTION
 # =========================
 KNOWN_PHARMA = {
     "Genentech","Roche","Novartis","Pfizer","AstraZeneca","Eli Lilly","Merck",
@@ -328,7 +312,7 @@ def extract_facts(headline: str, content: str, url: str) -> Dict:
     )
 
 # =========================
-# AWARENESS THEME & POLL (unchanged)
+# AWARENESS THEME & POLL
 # =========================
 def detect_theme_keyphrase(headline: str, content: str, url: str) -> str:
     facts = extract_facts(headline, content, url)
@@ -397,7 +381,7 @@ def build_awareness_poll(headline: str, content: str, url: str) -> str:
     return poll
 
 # =========================
-# LLM MINER (updated to use HF Inference when selected)
+# LLM MINER (Mistral only; HF Inference chat fallback; no FLAN)
 # =========================
 class PollMiner:
     def __init__(self, _model_name: str, use_inference_api: bool, token: Optional[str]):
@@ -405,41 +389,35 @@ class PollMiner:
         self.is_mistral = "mistral" in _model_name.lower()
         self.use_inference_api = use_inference_api and self.is_mistral
 
-        self.model_loaded = False
         self.hf_client = None
         self.gen_pipeline = None
+
+        if not self.is_mistral:
+            raise RuntimeError("Only Mistral is supported in this build.")
 
         try:
             if self.use_inference_api:
                 self.hf_client = get_hf_inference_client(_model_name, token)
-                self.model_loaded = True
             else:
-                self.gen_pipeline, is_mistral_local = get_local_pipeline(_model_name, token)
-                self.model_loaded = True
+                self.gen_pipeline = get_local_pipeline(_model_name, token)
         except Exception as e:
-            st.error(f"❌ Failed to initialize model {_model_name}: {e}")
-            st.warning("🔄 Falling back to google/flan-t5-base locally.")
-            # Fallback local Flan
-            self.gen_pipeline, _ = get_local_pipeline("google/flan-t5-base", token)
-            self.model_name = "google/flan-t5-base"
-            self.is_mistral = False
-            self.use_inference_api = False
-            self.model_loaded = True
+            st.error(f"❌ Failed to initialize Mistral: {e}")
+            self.hf_client = None
+            self.gen_pipeline = None
 
     def _format_mistral_prompt(self, headline: str, url: str, content: str, facts: Dict) -> str:
         snippet = content.strip()
         if len(snippet) > 1000:
             snippet = snippet[:1000]
-
         facts_str = json.dumps({
             "drug": facts["drug"],
             "companies": facts["companies"][:3],
             "indication": facts["indication"],
             "phase": facts["phase"],
-            "topics_true": [k for k,v in facts["topics"].items() if v]
+            "topics_true": [k for k, v in facts["topics"].items() if v]
         }, ensure_ascii=False)
 
-        prompt = f"""<s>[INST] You are a medical content specialist creating Twitter/X poll questions about breast cancer news.
+        return f"""<s>[INST] You are a medical content specialist creating Twitter/X poll questions about breast cancer news.
 
 TASK: Generate practice-focused Twitter/X poll questions that assess how this medical information impacts clinical practice.
 
@@ -447,7 +425,7 @@ CRITICAL RULES:
 - Focus on PRACTICE IMPACT: information utility, practice changes, clinical application
 - Use these question frameworks:
   * "Is this information practice-informing for [specific context]?"
-  * "Is this information practice-changing for [specific context]?" 
+  * "Is this information practice-changing for [specific context]?"
   * "Will you use this information in your practice for [specific context]?"
   * "How does this impact your clinical approach to [specific context]?"
 - Every question MUST explicitly mention specific clinical context from the facts (drug, indication, patient population, setting)
@@ -467,107 +445,99 @@ ARTICLE CONTENT:
 Generate several DISTINCT practice-focused poll questions. Format each poll as:
 Q: <practice-focused question with specific clinical context>
 - Option 1
-- Option 2  
+- Option 2
 - Option 3
 - Option 4 (optional)
 
 Ensure each question assesses clinical utility and practice impact. [/INST]"""
-        return prompt
-
-    def _format_flan_prompt(self, headline: str, url: str, content: str, facts: Dict) -> str:
-        snippet = content.strip()
-        if len(snippet) > 1000:
-            snippet = snippet[:1000]
-        facts_str = json.dumps({
-            "drug": facts["drug"],
-            "companies": facts["companies"][:3],
-            "indication": facts["indication"],
-            "phase": facts["phase"],
-            "topics_true": [k for k,v in facts["topics"].items() if v]
-        }, ensure_ascii=False)
-
-        return f"""Generate practice-focused Twitter/X poll questions assessing clinical utility and practice impact.
-
-FOCUS AREAS:
-- Is this information practice-informing?
-- Is this information practice-changing?
-- Will you use this in your practice?
-- How does this impact clinical approach?
-
-RULES:
-- Every question must focus on PRACTICE IMPACT and mention specific clinical context from facts
-- Use specific clinical details: {facts_str}
-- No generic questions - always tie to specific drugs, indications, or clinical scenarios
-- ≤ 280 chars including options. Provide 3–4 clinically relevant options.
-
-Headline: "{headline}"
-URL: {url}
-Article:
-\"\"\"{snippet}\"\"\"
-
-Output practice-focused poll blocks. Format:
-Q: <practice-impact question with specific context>
-- Option
-- Option
-- Option
-- Option (optional)
-"""
-
-    def _prompt(self, headline: str, url: str, content: str, facts: Dict) -> str:
-        if self.is_mistral:
-            return self._format_mistral_prompt(headline, url, content, facts)
-        else:
-            return self._format_flan_prompt(headline, url, content, facts)
 
     def _generate_with_inference_api(self, prompt: str, temperature: float, top_p: float) -> str:
-        """HF Inference API call for text-generation models."""
-        # Use safe defaults compatible with Mistral
-        return self.hf_client.text_generation(
-            prompt,
-            max_new_tokens=MAX_NEW_TOKENS,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=1.05,
-            return_full_text=False,  # only the completion
-            stream=False
-        )
+        """
+        Try text_generation first. If provider only supports 'conversational',
+        automatically switch to chat endpoint.
+        """
+        # Attempt text-generation
+        try:
+            return self.hf_client.text_generation(
+                prompt,
+                max_new_tokens=MAX_NEW_TOKENS,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=1.05,
+                return_full_text=False,
+                stream=False,
+            )
+        except Exception as e:
+            err_msg = str(e)
+            if "conversational" in err_msg.lower():
+                # Modern OpenAI-like chat path if available
+                try:
+                    chat = getattr(self.hf_client, "chat", None)
+                    if chat and hasattr(chat, "completions") and hasattr(chat.completions, "create"):
+                        resp = chat.completions.create(
+                            model=self.model_name,
+                            messages=[{"role": "user", "content": prompt}],
+                            max_tokens=MAX_NEW_TOKENS,
+                            temperature=temperature,
+                            top_p=top_p,
+                        )
+                        choice = resp.choices[0]
+                        if hasattr(choice, "message") and choice.message and "content" in choice.message:
+                            return choice.message["content"]
+                        if hasattr(choice, "text"):
+                            return choice.text
+                        raise RuntimeError("Chat completion returned an unexpected schema.")
+                except Exception:
+                    # Legacy API fallback, if present
+                    if hasattr(self.hf_client, "chat_completion"):
+                        resp = self.hf_client.chat_completion(
+                            messages=[{"role": "user", "content": prompt}],
+                            max_tokens=MAX_NEW_TOKENS,
+                            temperature=temperature,
+                            top_p=top_p,
+                        )
+                        if isinstance(resp, dict):
+                            if "choices" in resp and resp["choices"]:
+                                msg = resp["choices"][0].get("message", {})
+                                if "content" in msg:
+                                    return msg["content"]
+                            if "generated_text" in resp:
+                                return resp["generated_text"]
+                        if isinstance(resp, list) and resp and "generated_text" in resp[0]:
+                            return resp[0]["generated_text"]
+                        raise RuntimeError("Legacy chat completion returned an unexpected schema.")
+            # Not conversational-only → surface original error
+            raise
 
     def generate(self, headline: str, url: str, content: str, facts: Dict,
                  passes: int, temperature: float, top_p: float) -> List[str]:
 
+        if not self.hf_client and not self.gen_pipeline:
+            st.warning("Model not initialized; using rule-based fallback.")
+            return []
+
         all_blocks: List[str] = []
+
         for i in range(passes):
             try:
                 with st.spinner(f"Generating polls (pass {i+1}/{passes})..."):
-                    prompt = self._prompt(headline, url, content, facts)
+                    prompt = self._format_mistral_prompt(headline, url, content, facts)
 
-                    if self.use_inference_api:
+                    if self.hf_client:
                         out = self._generate_with_inference_api(prompt, temperature, top_p)
                     else:
-                        if self.is_mistral:
-                            # causal LM
-                            result = self.gen_pipeline(
-                                prompt,
-                                max_new_tokens=MAX_NEW_TOKENS,
-                                do_sample=True,
-                                temperature=temperature,
-                                top_p=top_p,
-                                num_return_sequences=1,
-                                pad_token_id=self.gen_pipeline.tokenizer.eos_token_id,
-                                return_full_text=False,
-                            )
-                            out = result[0]["generated_text"]
-                        else:
-                            # Flan text2text
-                            result = self.gen_pipeline(
-                                prompt,
-                                max_new_tokens=MAX_NEW_TOKENS,
-                                do_sample=True,
-                                temperature=temperature,
-                                top_p=top_p,
-                                num_return_sequences=1,
-                            )
-                            out = result[0]["generated_text"]
+                        # Local causal LM pipeline (Mistral)
+                        result = self.gen_pipeline(
+                            prompt,
+                            max_new_tokens=MAX_NEW_TOKENS,
+                            do_sample=True,
+                            temperature=temperature,
+                            top_p=top_p,
+                            num_return_sequences=1,
+                            pad_token_id=self.gen_pipeline.tokenizer.eos_token_id,
+                            return_full_text=False,
+                        )
+                        out = result[0]["generated_text"]
 
                     blocks = parse_polls_block(out)
                     for b in blocks:
@@ -621,7 +591,7 @@ Q: <practice-impact question with specific context>
         return final
 
 # =========================
-# RULE-BASED FALLBACK (unchanged)
+# RULE-BASED FALLBACK (no LLM)
 # =========================
 def rule_based_polls(facts: Dict) -> List[str]:
     polls: List[str] = []
@@ -679,7 +649,7 @@ def rule_based_polls(facts: Dict) -> List[str]:
 # =========================
 # PIPELINE (one article)
 # =========================
-def build_polls_for_article(headline: str, url: str, content: str) -> List[str]:
+def build_polls_for_article(headline: str, url: str, content: str):
     facts = extract_facts(headline, content, url)
     awareness = build_awareness_poll(headline, content, url)
 
@@ -688,6 +658,7 @@ def build_polls_for_article(headline: str, url: str, content: str) -> List[str]:
                                passes_per_article, temperature, top_p)
     if not llm_polls:
         llm_polls = rule_based_polls(facts)
+
     all_polls = [awareness] + llm_polls
     all_polls = list(dict.fromkeys([normalize_ws(p) for p in all_polls]))
     embedder = get_embedder()
@@ -759,8 +730,8 @@ if run_btn:
 # =========================
 results = []
 if run_btn and articles:
-    if "mistral" in model_name.lower() and use_hf_inference and not hf_token:
-        st.error("You selected the Inference API for Mistral, but no HF token is set.")
+    if use_hf_inference and not hf_token:
+        st.error("You selected HF Inference API but no token is set.")
     else:
         with st.spinner("Generating polls…"):
             for idx, art in enumerate(articles, start=1):
@@ -817,6 +788,6 @@ if run_btn and articles:
 
 st.markdown("---")
 st.caption(
-    "Tip: If polls look too generic, increase passes or switch to the larger model. "
-    "Each question must mention at least one extracted fact (drug/company/indication/phase/topic) and focus on practice impact."
+    "Tip: If polls look too generic, increase passes or keep the Inference API on. "
+    "Each question should mention at least one extracted fact and focus on practice impact."
 )
