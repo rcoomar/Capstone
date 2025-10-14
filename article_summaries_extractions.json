@@ -1,0 +1,427 @@
+[
+  {
+    "headline": "FDA Approves New Targeted Treatment For Advanced Hormone Receptor-Positive, HER2-Negative Breast Cancer With A PIK3CA Mutation",
+    "url": "https://www.gene.com/media/news-features/fda-approves-new-targeted-treatment-for-advanced-hormone-receptor-positive-her2-negative-breast-cancer-with-a-pik3ca-mutation",
+    "summary_tweet": "\"The FDA approved Itovebi (inavolisib) in combination with palbociclib and fulvestrant for first-line treatment of HR+, HER2-, PIK3CA-mutated metastatic breast cancer, doubling progression-free survival in the Phase III INAVO120 trial.\"",
+    "companies": [
+      "Genentech"
+    ],
+    "drugs": [
+      "Itovebi",
+      "inavolisib",
+      "palbociclib",
+      "fulvestrant",
+      "targeted therapy"
+    ]
+  },
+  {
+    "headline": "FDA Approves New Adjuvant Treatment for Certain Patients with HER2-Positive Early Breast Cancer",
+    "url": "https://www.gene.com/media/news-features/fda-approves-new-adjuvant-treatment-for-certain-patients-with-her2-positive-early-breast-cancer",
+    "summary_tweet": "\"FDA approved Kadcyla for adjuvant treatment of HER2-positive early breast cancer with residual invasive disease after neoadjuvant taxane and Herceptin-based treatment, based on Phase III KATHERINE study results.\"",
+    "companies": [
+      "Genentech"
+    ],
+    "drugs": [
+      "Kadcyla",
+      "ado-trastuzumab emtansine",
+      "Herceptin",
+      "taxane"
+    ]
+  },
+  {
+    "headline": "Genentech Medicine FDA Approved as First Cancer Immunotherapy for a Type of Breast Cancer",
+    "url": "https://www.gene.com/media/news-features/genentech-medicine-fda-approved-as-first-cancer-immunotherapy-for-a-type-of-breast-cancer",
+    "summary_tweet": "\"Tecentriq plus Abraxane approved for unresectable locally advanced or metastatic triple-negative breast cancer with PD-L1 expression, based on progression-free survival.\"",
+    "companies": [
+      "Genentech"
+    ],
+    "drugs": [
+      "Tecentriq",
+      "atezolizumab",
+      "Abraxane",
+      "paclitaxel",
+      "nab-paclitaxel",
+      "chemotherapy",
+      "immunotherapy"
+    ]
+  },
+  {
+    "headline": "FDA Approves New Treatment Option for Adjuvant Treatment of Specific Type of Early Breast Cancer",
+    "url": "https://www.gene.com/media/news-features/fda-approves-new-treatment-option-for-adjuvant-treatment-of-specific-type-of-early-breast-cancer",
+    "summary_tweet": "\"FDA approved Perjeta (pertuzumab) with Herceptin (trastuzumab) and chemotherapy for adjuvant treatment of HER2-positive early breast cancer at high risk of recurrence, based on Phase III APHINITY study results.\" -> OK, but too long",
+    "companies": [
+      "Genentech"
+    ],
+    "drugs": [
+      "Perjeta",
+      "pertuzumab",
+      "Herceptin",
+      "trastuzumab",
+      "chemotherapy"
+    ]
+  },
+  {
+    "headline": "Perjeta Approved For HER2-Positive Metastatic Breast Cancer",
+    "url": "https://www.gene.com/media/news-features/perjeta-approved-for-her2-positive-metastatic-breast-cancer",
+    "summary_tweet": "\"Perjeta was approved in combination with Herceptin and docetaxel for HER2-positive metastatic breast cancer, extending progression-free survival by 6.1 months compared to Herceptin and docetaxel alone.\" # Removed the hashtag as per the instructions",
+    "companies": [
+      "Genentech"
+    ],
+    "drugs": [
+      "Perjeta",
+      "pertuzumab",
+      "Herceptin",
+      "trastuzumab",
+      "docetaxel",
+      "chemotherapy"
+    ]
+  },
+  {
+    "headline": "Press releaseSep 26, 2025Novartis to showcase transformative data in advanced prostate and early breast cancer at ESMO 2025Key data from PSMAddition has been selected for a Presidential session; data to showcase the efficacy and safety of PluvictoTM plus standard of care (SoC) versus SoC alone in PSMA+ mHSPCNATALEE five-…",
+    "url": "https://www.novartis.com/news/media-releases/novartis-showcase-transformative-data-advanced-prostate-and-early-breast-cancer-esmo-2025",
+    "summary_tweet": "Novartis to present data on Pluvicto plus standard of care versus standard of care alone in PSMA+ metastatic hormone-sensitive prostate cancer at ESMO 2025.",
+    "companies": [
+      "Novartis",
+      "Novartis AG"
+    ],
+    "drugs": [
+      "Pluvicto",
+      "PSMA"
+    ]
+  },
+  {
+    "headline": "Press releaseSep 26, 2025Novartis to showcase transformative data in advanced prostate and early breast cancer at ESMO 2025Key data from PSMAddition has been selected for a Presidential session; data to showcase the efficacy and safety of PluvictoTM plus standard of care (SoC) versus SoC alone in PSMA+ mHSPCNATALEE five-…",
+    "url": "https://www.novartis.com/news/media-releases/novartis-showcase-transformative-data-advanced-prostate-and-early-breast-cancer-esmo-2025",
+    "summary_tweet": "Novartis will present data on Pluvicto plus standard of care versus standard of care alone in PSMA+ metastatic hormone-sensitive prostate cancer at ESMO 2025.",
+    "companies": [
+      "Novartis",
+      "Novartis AG"
+    ],
+    "drugs": [
+      "Pluvicto"
+    ]
+  },
+  {
+    "headline": "Breast Cancer",
+    "url": "https://www.menarini.com/en-us/oncology/solid-tumors/breast-cancer.html",
+    "summary_tweet": "Menarini Group focuses on breast cancer, a heterogeneous disease, and other oncology areas including hematologic malignancies and solid tumors.",
+    "companies": [
+      "Menarini"
+    ],
+    "drugs": [
+      "Anti Infectives",
+      "Cardiometabolic",
+      "Respiratory & Allergology",
+      "Gastrointestinal Disorders",
+      "Pain",
+      "Men's Health",
+      "Analgesics",
+      "Cough, Cold & Allergy",
+      "Gastrointestinals",
+      "Lifestyle OTCs",
+      "Vitamins, Minerals & Supplements",
+      "Oncology",
+      "Dermatology",
+      "Aesthetic Medicine",
+      "Diagnostics",
+      "Professional Diagnostics",
+      "Advanced Diagnostics",
+      "Prenatal testing"
+    ]
+  },
+  {
+    "headline": "Breast Cancer",
+    "url": "https://www.arvinas.com/research-and-development/estrogen-receptor/",
+    "summary_tweet": "\"Arvinas and Pfizer are developing vepdegestrant, an oral PROTAC estrogen receptor degrader, for ER+/HER2- locally advanced or metastatic breast cancer, with Phase 3 clinical studies underway.\"",
+    "companies": [
+      "Arvinas",
+      "Pfizer"
+    ],
+    "drugs": [
+      "Vepdegestrant",
+      "Estrogen Receptor",
+      "PROTAC",
+      "Endocrine therapy",
+      "Hormone therapy",
+      "Fulvestrant",
+      "CDK4/6 inhibitors"
+    ]
+  },
+  {
+    "headline": "Patients with Breast Cancer",
+    "url": "https://www.arvinas.com/patients/patients-with-breast-cancer/",
+    "summary_tweet": "\"Arvinas is developing treatments for breast cancer, which affects nearly 2.3 million women globally and has a 12% lifetime risk for women in the US.\"",
+    "companies": [
+      "Arvinas"
+    ],
+    "drugs": [
+      "Breast Cancer",
+      "PROTAC Discovery Engine"
+    ]
+  },
+  {
+    "headline": "Breast Cancer",
+    "url": "https://www.arvinas.com/research-and-development/estrogen-receptor/",
+    "summary_tweet": "\"Arvinas and Pfizer are developing vepdegestrant, an oral PROTAC estrogen receptor degrader, for ER+/HER2- locally advanced or metastatic breast cancer, with Phase 3 clinical studies underway.\"",
+    "companies": [
+      "Arvinas",
+      "Pfizer"
+    ],
+    "drugs": [
+      "Vepdegestrant",
+      "Estrogen Receptor",
+      "PROTAC",
+      "Fulvestrant",
+      "Endocrine therapy",
+      "Hormone therapy",
+      "CDK4/6 inhibitors"
+    ]
+  },
+  {
+    "headline": "Patients with Breast Cancer",
+    "url": "https://www.arvinas.com/patients/patients-with-breast-cancer/",
+    "summary_tweet": "\"Arvinas provides resources for patients with breast cancer, a disease affecting nearly 2.3 million women globally in 2022, with a 12 percent lifetime risk for women in the US.\"",
+    "companies": [
+      "Arvinas"
+    ],
+    "drugs": [
+      "Breast Cancer",
+      "PROTAC"
+    ]
+  },
+  {
+    "headline": "Breast Cancer",
+    "url": "https://atossatherapeutics.com/breast-cancer/",
+    "summary_tweet": "Atossa Therapeutics is developing (Z)-endoxifen for breast cancer, focusing on preventive care, neoadjuvant therapy, adjuvant therapy, and metastatic disease management, aiming to deliver consistent and well-tolerated oral therapy.",
+    "companies": [
+      "Atossatherapeutics"
+    ],
+    "drugs": [
+      "(Z)-endoxifen",
+      "tamoxifen",
+      "SERMs",
+      "neoadjuvant therapy",
+      "adjuvant therapy",
+      "aromatase inhibitors",
+      "endocrine therapies"
+    ]
+  },
+  {
+    "headline": "Breast Cancer",
+    "url": "https://atossatherapeutics.com/breast-cancer/",
+    "summary_tweet": "Atossa Therapeutics is developing (Z)-endoxifen for breast cancer, focusing on preventive care, neoadjuvant therapy, adjuvant therapy, and managing metastatic disease, with the goal of delivering a more consistent and well-tolerated oral therapy.",
+    "companies": [
+      "Atossatherapeutics"
+    ],
+    "drugs": [
+      "(Z)-endoxifen",
+      "tamoxifen",
+      "neoadjuvant therapy",
+      "adjuvant therapy",
+      "SERMs",
+      "aromatase inhibitors"
+    ]
+  },
+  {
+    "headline": "Breast Cancer",
+    "url": "https://atossatherapeutics.com/breast-cancer/",
+    "summary_tweet": "Atossa Therapeutics is developing (Z)-endoxifen for breast cancer, focusing on preventive care, neoadjuvant therapy, adjuvant therapy, and metastatic disease management. <|end_of_text|>",
+    "companies": [
+      "Atossatherapeutics"
+    ],
+    "drugs": [
+      "(Z)-endoxifen",
+      "tamoxifen",
+      "neoadjuvant therapy",
+      "adjuvant therapy",
+      "SERMs",
+      "endocrine therapies",
+      "hormonal strategies",
+      "aromatase inhibitors"
+    ]
+  },
+  {
+    "headline": "Breast Cancer",
+    "url": "https://sermonixpharma.com/breast-cancer/",
+    "summary_tweet": "\"Lasofoxifene is being developed to treat estrogen receptor-positive metastatic breast cancer, where patients often develop resistance to hormonal therapy, including aromatase inhibitors.\"",
+    "companies": [
+      "Sermonix Pharma",
+      "Sermonix"
+    ],
+    "drugs": [
+      "Lasofoxifene",
+      "aromatase inhibitor",
+      "hormonal therapy",
+      "endocrine therapy",
+      "chemotherapy"
+    ]
+  },
+  {
+    "headline": "Sermonix Pharmaceuticalsâ Lasofoxifene Is Well Tolerated, Demonstrates Promising Ki67 Suppression in Phase 2 I-SPY 2 Arm Evaluating Therapy in Neoadjuvant Breast Cancer Setting",
+    "url": "https://sermonixpharma.com/sermonix-pharmaceuticals-lasofoxifene-is-well-tolerated-demonstrates-promising-ki67-suppression-in-phase-2-i-spy-2-arm-evaluating-therapy-in-neoadjuvant-breast-cancer-setting/",
+    "summary_tweet": "\"Lasofoxifene shows promising Ki67 suppression in Phase 2 I-SPY 2 arm evaluating therapy in neoadjuvant breast cancer setting, with median Ki67 expression decreasing from 10% to 4% at Week 3.\"",
+    "companies": [
+      "Sermonix Pharma",
+      "AstraZeneca",
+      "Sermonix Pharmaceuticals Inc",
+      "Ligand Pharmaceuticals Inc",
+      "Sermonix",
+      "Pharmaceuticals Inc"
+    ],
+    "drugs": [
+      "Lasofoxifene",
+      "abemaciclib",
+      "chemotherapy",
+      "endocrine therapy"
+    ]
+  },
+  {
+    "headline": "Sermonix Announces Clinical Breast Cancer Publication of Article Examining Effects of Lasofoxifene Versus Fulvestrant on Urogenital Symptoms in Patients with ESR1-Mutated ER+/HER2- Metastatic Breast Cancer",
+    "url": "https://sermonixpharma.com/sermonix-announces-clinical-breast-cancer-publication-of-article-examining-effects-of-lasofoxifene-versus-fulvestrant-on-urogenital-symptoms-in-patients-with-esr1-mutated-er-her2-metastatic-breast-c/",
+    "summary_tweet": "\"Lasofoxifene improved vaginal and vulvar symptoms in patients with ESR1-mutated ER+/HER2- metastatic breast cancer, while fulvestrant did not, in a secondary endpoint analysis of the ELAINE-1 study.\"",
+    "companies": [
+      "Sermonix Pharma",
+      "AstraZeneca",
+      "Sermonix Pharmaceuticals Inc",
+      "Ligand Pharmaceuticals Inc",
+      "Sermonix",
+      "Pharmaceuticals Inc"
+    ],
+    "drugs": [
+      "Lasofoxifene",
+      "Fulvestrant"
+    ]
+  },
+  {
+    "headline": "Sermonix Pharmaceuticals to Host Oral Presentation on Vaginal and Sexual Health at RISE UP for Breast Cancer Conference",
+    "url": "https://sermonixpharma.com/sermonix-pharmaceuticals-to-host-oral-presentation-on-vaginal-and-sexual-health-at-rise-up-for-breast-cancer-conference/",
+    "summary_tweet": "Sermonix Pharmaceuticals to present on vaginal and sexual health in ER+/HER2- metastatic breast cancer at RISE UP conference and share Phase 2 trial results on neoadjuvant lasofoxifene in HR+/HER2- locally advanced breast cancer.",
+    "companies": [
+      "Sermonix Pharma",
+      "AstraZeneca",
+      "Sermonix Pharmaceuticals Inc",
+      "Ligand Pharmaceuticals Inc",
+      "Sermonix",
+      "Pharmaceuticals Inc"
+    ],
+    "drugs": [
+      "Lasofoxifene",
+      "ESR1",
+      "endocrine therapy",
+      "I-SPY 2 TRIAL",
+      "EOP",
+      "CDK4/6 inhibitor"
+    ]
+  },
+  {
+    "headline": "Sermonix Pharmaceuticals Completes Enrollment of Phase 2 I-SPY 2 Arm Evaluating Lasofoxifene in Neoadjuvant Breast Cancer Setting",
+    "url": "https://sermonixpharma.com/sermonix-pharmaceuticals-completes-enrollment-of-phase-2-i-spy-2-arm-evaluating-lasofoxifene-in-neoadjuvant-breast-cancer-setting/",
+    "summary_tweet": "\"Sermonix completes enrollment of Phase 2 I-SPY 2 arm evaluating lasofoxifene as neoadjuvant endocrine therapy in HR+/HER2- locally advanced breast cancer, with 20 patients enrolled.\"",
+    "companies": [
+      "Sermonix Pharma",
+      "AstraZeneca",
+      "Sermonix Pharmaceuticals Inc",
+      "Sermonix",
+      "Pharmaceuticals Inc"
+    ],
+    "drugs": [
+      "Lasofoxifene",
+      "abemaciclib",
+      "chemotherapy",
+      "neoadjuvant endocrine therapy",
+      "hormone treatment-resistant breast tumors",
+      "aromatase inhibition",
+      "selective estrogen receptor modulator",
+      "SERM",
+      "AIs",
+      "I-SPY 2",
+      "EOP",
+      "ELAINE-3",
+      "ESR1"
+    ]
+  },
+  {
+    "headline": "Sermonix Pharmaceuticals Receives U.S. Patent for Lasofoxifene as Method for Treating Aromatase-Resistant ER+ Breast Cancer in the Absence of ESR1 Mutations",
+    "url": "https://sermonixpharma.com/sermonix-pharmaceuticals-receives-u-s-patent-for-lasofoxifene-as-method-for-treating-aromatase-resistant-er-breast-cancer-in-the-absence-of-esr1-mutations/",
+    "summary_tweet": "Sermonix Pharmaceuticals receives US patent for lasofoxifene to treat aromatase-resistant ER+ breast cancer in the absence of ESR1 mutations, expanding potential patient population beyond those with ESR1 mutations.",
+    "companies": [
+      "Sermonix Pharma",
+      "AstraZeneca",
+      "Sermonix Pharmaceuticals Inc",
+      "Eli Lilly",
+      "Sermonix",
+      "Pharmaceuticals Inc"
+    ],
+    "drugs": [
+      "Lasofoxifene",
+      "Aromatase",
+      "ER+",
+      "ESR1",
+      "Fulvestrant",
+      "Abemaciclib",
+      "Verzenio",
+      "CDK4/6i"
+    ]
+  },
+  {
+    "headline": "Sermonix Pharmaceuticals Announces Breast Cancer Research Publication of Paper Examining Lasofoxifeneâs Preclinical Effects on Aromatase Inhibitor Resistant Non-ESR1 Mutated Breast Cancer",
+    "url": "https://sermonixpharma.com/sermonix-pharmaceuticals-announces-breast-cancer-research-publication-of-paper-examining-lasofoxifenes-preclinical-effects-on-aromatase-inhibitor-resistant-non-esr1-mutated-breast-cancer/",
+    "summary_tweet": "\"Lasofoxifene shows preclinical efficacy in aromatase inhibitor-resistant non-ESR1 mutated breast cancer, with reduced tumor growth and metastases in mouse models, and is being investigated in Phase 3 ELAINE-3 study for ESR1-mutated breast cancer.\"",
+    "companies": [
+      "Sermonix Pharma",
+      "AstraZeneca",
+      "Sermonix Pharmaceuticals Inc",
+      "Eli Lilly",
+      "Sermonix",
+      "Pharmaceuticals Inc"
+    ],
+    "drugs": [
+      "Lasofoxifene",
+      "Aromatase Inhibitor",
+      "Palbociclib",
+      "Fulvestrant",
+      "Letrozole",
+      "Abemaciclib",
+      "Endocrine therapy"
+    ]
+  },
+  {
+    "headline": "2025-04-23 |Alligator Bioscience announces initiation of HLX22 Phase 2 trial in breast cancer by Shanghai Henlius Biotech, Inc.",
+    "url": "https://alligatorbioscience.se/en/mfn_news/alligator-bioscience-announces-initiation-of-hlx22-phase-2-trial-in-breast-cancer-by-shanghai-henlius-biotech-inc/",
+    "summary_tweet": "Alligator Bioscience announces initiation of HLX22 Phase 2 trial in breast cancer by Shanghai Henlius Biotech, evaluating HLX22 in combination with trastuzumab deruxtecan for locally advanced or metastatic breast cancer.",
+    "companies": [
+      "Alligatorbioscience"
+    ],
+    "drugs": [
+      "HLX22",
+      "trastuzumab deruxtecan",
+      "Mitazalimab",
+      "ATOR-4066",
+      "ALG.APV-527",
+      "immunotherapy"
+    ]
+  },
+  {
+    "headline": "Breast Cancer(29)",
+    "url": "https://www.exactsciences.com/news-events/articles/cancer-type/breast-cancer",
+    "summary_tweet": "\"Oncotype DX Breast DCIS Score and Oncotype DX Breast Recurrence Score are tests for breast cancer.\" is rewritten as",
+    "companies": [
+      "Exactsciences",
+      "Exact Sciences Corporation",
+      "Sciences Corporation"
+    ],
+    "drugs": [
+      "Cancerguard",
+      "Cologuard",
+      "Cologuard Plus",
+      "Oncodetect",
+      "OncoExTra",
+      "Oncoguard",
+      "Oncotype DX Breast DCIS Score",
+      "Oncotype DX Breast Recurrence Score",
+      "Oncotype DX Colon Recurrence Score",
+      "Riskguard",
+      "radiation therapy"
+    ]
+  }
+]
