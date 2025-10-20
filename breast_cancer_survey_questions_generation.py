@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from urllib.parse import urlparse
+from datetime import datetime
 
 import numpy as np
 import streamlit as st
@@ -23,7 +24,6 @@ MAX_POLL_OPTIONS = 4
 MAX_POLLS_PER_ARTICLE = 4  # <-- hard cap (includes awareness, if present)
 
 # Lock to server-side creds by default
-USE_WATSONX_SECRETS = True   # read watsonx creds from st.secrets/env; never ask user
 DEFAULT_PROVIDER = "watsonx"
 DEFAULT_MODEL = LLAMA_MODEL
 
@@ -33,10 +33,6 @@ st.set_page_config(page_title="Breast Cancer News → Poll Generator", layout="w
 # Secrets / Env helpers
 # =========================
 def get_watsonx_creds():
-    """
-    Pull watsonx creds from Streamlit secrets, falling back to env vars.
-    Returns: (api_key, url, space_or_project_id_str)
-    """
     api_key = st.secrets.get("WATSONX_API_KEY") or os.getenv("WATSONX_API_KEY", "")
     url = st.secrets.get("WATSONX_URL") or os.getenv("WATSONX_URL", "https://us-south.ml.cloud.ibm.com")
     space_id = st.secrets.get("WATSONX_SPACE_ID") or os.getenv("WATSONX_SPACE_ID", "")
@@ -45,9 +41,6 @@ def get_watsonx_creds():
     return api_key, url, space_or_project
 
 def get_hf_token():
-    """
-    Optional HF token if you want to use Hugging Face Inference.
-    """
     return st.secrets.get("HF_TOKEN") or os.getenv("HF_TOKEN", "")
 
 # =========================
@@ -56,12 +49,10 @@ def get_hf_token():
 with st.sidebar:
     st.title("⚙️ Settings")
 
-    # You can allow the user to switch providers; no keys are asked for.
     provider = st.selectbox(
         "Provider",
         ["watsonx", "huggingface"],
         index=0 if DEFAULT_PROVIDER == "watsonx" else 1,
-        help="Pick the platform to call the model.",
     )
 
     model_name = st.selectbox(
@@ -72,13 +63,11 @@ with st.sidebar:
     )
 
     if provider == "watsonx":
-        # No key inputs—pull from secrets/env
         wxa_api_key, wxa_url, wxa_project_or_space = get_watsonx_creds()
         st.caption("Using server-side watsonx credentials (Streamlit secrets / env).")
         use_hf_inference = False
         hf_token = None
     else:
-        # Optional: Hugging Face Inference without asking users for token
         hf_token = get_hf_token()
         use_hf_inference = st.toggle("Use HF Inference API (recommended)", value=True)
         if not hf_token:
@@ -106,9 +95,16 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.caption("Input supports both legacy schema and the new schema with `entities` and `published_date`.")
+    st.subheader("Filter by date (Published)")
+    # Month & Year filter from published_date; we apply when processing
+    month_choice = st.selectbox(
+        "Month",
+        ["All", "January", "February", "March", "April", "May", "June",
+         "July", "August", "September", "October", "November", "December"],
+        index=0
+    )
+    year_choice = st.text_input("Year (YYYY or blank for All)", value="")
 
-    # --- Grounding validation controls ---
     st.markdown("---")
     st.subheader("Grounding validation")
     grounding_threshold = st.slider(
@@ -122,7 +118,7 @@ with st.sidebar:
         help="Overall = (1 - weight) * semantic_similarity + weight * entity_overlap"
     )
 
-# Authenticate HF (server-side only; no user prompt)
+# Authenticate HF (server-side only)
 if provider == "huggingface" and hf_token:
     try:
         hf_login(token=hf_token)
@@ -162,7 +158,7 @@ def get_local_mistral_pipeline(_model_name: str, token: Optional[str]):
     )
     return pipe
 
-# ---- watsonx helper (feature-detect chat vs text) ----
+# ---- watsonx helper
 @st.cache_resource(show_spinner=False)
 def get_watsonx_model(model_id: str, api_key: str, url: str, project_or_space_id: str, params: dict):
     try:
@@ -172,16 +168,13 @@ def get_watsonx_model(model_id: str, api_key: str, url: str, project_or_space_id
         raise RuntimeError(
             "ibm-watsonx-ai SDK is not installed. Add 'ibm-watsonx-ai' to requirements.txt and redeploy."
         )
-
     creds = Credentials(url=url, api_key=api_key)
-
     kwargs = {}
     token = (project_or_space_id or "").strip()
     if token.lower().startswith(("space:", "spaces:")):
         kwargs["space_id"] = token.split(":", 1)[-1]
     else:
         kwargs["project_id"] = token
-
     mdl = Model(model_id=model_id, credentials=creds, params=params, **kwargs)
     return mdl
 
@@ -276,15 +269,8 @@ def dedup_semantic(blocks: List[str], threshold: float, embedder) -> List[str]:
     return keep
 
 # =========================
-# ENTITY/FACT EXTRACTION
+# JSON → FACTS (NO inference)
 # =========================
-KNOWN_PHARMA = {
-    "Genentech","Roche","Novartis","Pfizer","AstraZeneca","Eli Lilly","Merck",
-    "Sanofi","Gilead","BMS","Amgen","GSK","Bayer","Takeda","Boehringer Ingelheim",
-    "BeiGene","Seagen","Roche Genentech","Sermonix Pharma","Sermonix",
-}
-ORG_SUFFIXES = r"(?: Inc\.?| Corp\.?| Corporation| Ltd\.?| LLC| plc| AG| SA| NV| Co\.?)"
-
 def company_from_url(url: str) -> Optional[str]:
     try:
         host = urlparse(url).netloc.lower()
@@ -293,28 +279,6 @@ def company_from_url(url: str) -> Optional[str]:
         for prefix in ("www.", "amp.", "m.", "news."):
             if host.startswith(prefix):
                 host = host[len(prefix):]
-        mapping = {
-            "sermonixpharma.com": "Sermonix Pharma",
-            "gene.com": "Genentech",
-            "roche.com": "Roche",
-            "novartis.com": "Novartis",
-            "pfizer.com": "Pfizer",
-            "astrazeneca.com": "AstraZeneca",
-            "lilly.com": "Eli Lilly",
-            "merck.com": "Merck",
-            "sanofi.com": "Sanofi",
-            "gilead.com": "Gilead",
-            "bms.com": "BMS",
-            "amgen.com": "Amgen",
-            "gsk.com": "GSK",
-            "bayer.com": "Bayer",
-            "takeda.com": "Takeda",
-            "boehringer-ingelheim.com": "Boehringer Ingelheim",
-            "beigene.com": "BeiGene",
-            "seagen.com": "Seagen",
-        }
-        if host in mapping:
-            return mapping[host]
         parts = host.split(".")
         brand = parts[-2] if len(parts) >= 2 else parts[0]
         brand = brand.replace("-", " ").strip()
@@ -324,73 +288,78 @@ def company_from_url(url: str) -> Optional[str]:
     except Exception:
         return None
 
-def pick_indication(text: str) -> str:
-    m = re.search(r"(HR\+\s*[,/]*\s*HER2-\s*.*?breast cancer|HER2\+\s*.*?breast cancer|HER2-\s*.*?breast cancer|HR\+\s*.*?breast cancer|metastatic breast cancer|early breast cancer|breast cancer)", text, flags=re.I)
-    return m.group(1) if m else "breast cancer"
+def _coerce_list(x) -> List[str]:
+    if not x:
+        return []
+    if isinstance(x, list):
+        return [str(i).strip() for i in x if str(i).strip()]
+    return [str(x).strip()]
 
-def pick_phase(lower_text: str) -> Optional[str]:
-    m = re.search(r"\bphase\s*(I{1,3}|IV|V|\d)\b", lower_text)
-    return m.group(1).upper() if m else None
+def parse_date_safe(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    s = s.strip()
+    fmts = [
+        "%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y",
+        "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M:%S", "%b %d, %Y", "%B %d, %Y",
+        "%Y-%m", "%B %Y", "%b %Y"
+    ]
+    for f in fmts:
+        try:
+            return datetime.strptime(s, f)
+        except Exception:
+            continue
+    return None
 
-def detect_topics(text: str, lower_text: str) -> Dict[str, bool]:
-    return dict(
-        fda_approval=("fda" in lower_text and re.search(r"\bapprov|\bauthoriz", lower_text)),
-        trial=bool(re.search(r"\b(clinical )?trial\b|\bstudy\b", lower_text)),
-        acquisition=bool(re.search(r"\bacquisit|acquire|merger\b", lower_text)),
-        partnership=bool(re.search(r"\b(partner|collaborat|licens|alliance)\w*\b", lower_text)),
-        endpoints=bool(re.search(r"\bprogression[- ]free survival\b|\bPFS\b|\boverall survival\b|\bOS\b|\bORR\b|\bresponse rate\b", text, flags=re.I)),
-        setting_firstline=bool(re.search(r"\bfirst[- ]?line\b", lower_text)),
-        setting_adjuvant=bool(re.search(r"\badjuvant\b", lower_text)),
-        mutation_pik3ca=("pik3ca" in lower_text),
-        receptor_hrpos=("hr+" in lower_text or "hormone receptor-positive" in lower_text),
-        her2_neg=("her2-" in lower_text or "her2-negative" in lower_text),
-        her2_pos=("her2+" in lower_text or "her2-positive" in lower_text),
-    )
+def adapt_article_schema(art: Dict) -> Dict:
+    headline = (art.get("headline") or art.get("title") or "").strip()
+    url = (art.get("url") or "").strip()
+    content = (art.get("content") or art.get("article") or "").strip()
+    summary = (art.get("summary_280") or art.get("summary_tweet") or art.get("summary") or "").strip()
+    published_date_raw = (art.get("published_date") or art.get("date") or "").strip()
 
-def extract_facts_from_inputs(
-    headline: str,
-    content_or_summary: str,
-    url: str,
-    companies_in: List[str],
-    drugs_in: List[str],
-    indications_in: List[str],
-    trial_phases_in: List[str]
-) -> Dict:
-    """
-    Build a facts dict that uses provided companies/drugs/indications/phases when present,
-    and still parses indication/phase/topics from the headline/content text.
-    """
-    text = f"{headline or ''}\n{content_or_summary or ''}"
-    text_norm = re.sub(r"\s+", " ", text).strip()
-    t = text_norm.lower()
+    entities = art.get("entities") or {}
+    drugs = _coerce_list(entities.get("drug_names") or art.get("drugs"))
+    companies = _coerce_list(entities.get("company_name") or art.get("companies"))
+    trial_names = _coerce_list(entities.get("trial_names"))
+    trial_phases = _coerce_list(entities.get("trial_phases"))
+    indications = _coerce_list(entities.get("indications"))
 
-    companies = list(companies_in or [])
-    pub = company_from_url(url) or None
-    if pub and pub not in companies:
-        companies.insert(0, pub)
+    # publisher derived from URL only (no inference)
+    publisher = company_from_url(url)
 
-    # Choose a single primary drug for awareness (keep full list too)
-    drug_primary = (drugs_in[0] if drugs_in else None)
+    # grounding text = content; if missing, use headline + summary
+    grounding_text = content if content else (headline + "\n\n" + summary)
 
-    # Prefer incoming indication/phase if supplied via entities
-    indication = (indications_in[0] if indications_in else None) or pick_indication(text_norm)
-    phase = (trial_phases_in[0].upper() if trial_phases_in else None) or pick_phase(t)
-    topics = detect_topics(text_norm, t)
-    return dict(
-        companies=companies,
-        publisher=pub,
-        drug=drug_primary,
-        drugs=drugs_in or [],
-        indication=indication,
-        phase=phase,
-        topics=topics,
-    )
+    return {
+        "headline": headline,
+        "url": url,
+        "content": content,
+        "summary": summary,
+        "published_date": published_date_raw,
+        "published_dt": parse_date_safe(published_date_raw),
+        "entities": {
+            "drug_names": drugs,
+            "company_name": companies,
+            "trial_names": trial_names,
+            "trial_phases": trial_phases,
+            "indications": indications,
+        },
+        "publisher": publisher,
+        "grounding_text": grounding_text,
+        "raw": art,  # keep original for display
+    }
 
 # =========================
-# AWARENESS POLL
+# AWARENESS POLL (light-touch, JSON-only)
 # =========================
-def build_awareness_poll(facts: Dict) -> str:
-    drug, ind = facts.get("drug"), facts.get("indication", "breast cancer")
+def build_awareness_poll(json_entities: Dict) -> str:
+    drugs = json_entities.get("drug_names") or []
+    inds = json_entities.get("indications") or []
+    drug = drugs[0] if drugs else None
+    ind = inds[0] if inds else None
+
     if drug and ind:
         q = f"Q: Were you aware of this {drug} development for {ind} before reading?"
     elif ind:
@@ -404,7 +373,7 @@ def build_awareness_poll(facts: Dict) -> str:
     return poll
 
 # =========================
-# LLM MINER (unchanged core)
+# LLM MINER — uses CONTENT only; no entity extraction
 # =========================
 class PollMiner:
     def __init__(self, _model_name: str, provider: str, use_hf_inference: bool,
@@ -422,15 +391,8 @@ class PollMiner:
             if provider == "watsonx":
                 if not (wxa_api_key and wxa_url and wxa_project_or_space):
                     raise RuntimeError("Missing watsonx credentials (API key, URL, Project/Space ID).")
-
-                base_params = {
-                    "decoding_method": "sample",
-                    "temperature": 0.8,
-                    "top_p": 0.9,
-                    "max_new_tokens": 480,
-                }
+                base_params = {"decoding_method": "sample", "temperature": 0.8, "top_p": 0.9, "max_new_tokens": 480}
                 self.wxa_model = get_watsonx_model(_model_name, wxa_api_key, wxa_url, wxa_project_or_space, base_params)
-
             elif provider == "huggingface":
                 if use_hf_inference:
                     self.hf_client = get_hf_inference_client(_model_name, hf_token)
@@ -440,31 +402,36 @@ class PollMiner:
                     self.gen_pipeline = get_local_mistral_pipeline(_model_name, hf_token)
             else:
                 raise RuntimeError(f"Unsupported provider: {provider}")
-
         except Exception as e:
             st.error(f"❌ Model init failed: {e}")
             self.hf_client = None
             self.gen_pipeline = None
             self.wxa_model = None
 
-    def _format_prompt(self, headline: str, url: str, grounding_text: str, facts: Dict) -> str:
+    def _format_prompt(self, headline: str, url: str, grounding_text: str, key_facts: Dict) -> str:
         snippet = grounding_text.strip()
         if len(snippet) > 1600:
             snippet = snippet[:1600]
-        facts_str = json.dumps({
-            "drug": facts.get("drug"),
-            "drugs": facts.get("drugs", [])[:6],
-            "companies": facts.get("companies", [])[:6],
-            "indication": facts.get("indication"),
-            "phase": facts.get("phase"),
-            "topics_true": [k for k, v in facts.get("topics", {}).items() if v],
-        }, ensure_ascii=False)
+
+        # Only pass JSON-provided facts. No inferred fields.
+        facts_payload = {
+            "headline": headline,
+            "url": url,
+            "entities": {
+                "drug_names": key_facts.get("drug_names", [])[:6],
+                "company_name": key_facts.get("company_name", [])[:6],
+                "trial_names": key_facts.get("trial_names", [])[:6],
+                "trial_phases": key_facts.get("trial_phases", [])[:6],
+                "indications": key_facts.get("indications", [])[:6],
+            }
+        }
+        facts_str = json.dumps(facts_payload, ensure_ascii=False)
 
         return f"""
 You are an assistant that writes Twitter/X poll questions to understand a **doctor's (HCP) perspective** on ONE breast cancer news article.
 
 STRICT CONTENT RULES — READ CAREFULLY:
-- USE ONLY information that appears in the headline or article content/summary below (or in Key Facts). Do NOT invent drugs, companies, endpoints, biomarkers, or settings.
+- USE ONLY information that appears in the headline or article content below (or in Key Facts, which directly mirrors the provided JSON). Do NOT invent drugs, companies, endpoints, biomarkers, or settings.
 - Each poll MUST clearly reference the specific context present in the article (e.g., drug name, indication, phase/setting, relevant endpoint if mentioned).
 - Produce AT MOST **4** polls and make them mutually DISTINCT in focus (avoid paraphrases):
   • practice impact (practice-informing vs practice-changing)
@@ -475,12 +442,10 @@ STRICT CONTENT RULES — READ CAREFULLY:
 - Return COMPLETE polls only (no truncated options).
 - Purpose: elicit the **doctor's perspective** (practice intent), not generic Q&A.
 
-ARTICLE INFORMATION:
-Headline: "{headline}"
-URL: {url}
-Key Facts (only for grounding; do not add new facts): {facts_str}
+KEY FACTS (from JSON; do not add new facts):
+{facts_str}
 
-ARTICLE CONTENT/SUMMARY (truncated):
+ARTICLE CONTENT (truncated if long):
 {snippet}
 
 OUTPUT FORMAT (up to 4 polls; no extra text):
@@ -494,7 +459,6 @@ Q: <HCP-perspective question that strictly reflects article content>
     def _gen_watsonx(self, prompt: str, temperature: float, top_p: float, max_new_tokens: int) -> str:
         if not self.wxa_model:
             raise RuntimeError("watsonx model not initialized")
-
         try:
             self.wxa_model.params.update({
                 "temperature": float(temperature),
@@ -600,7 +564,7 @@ Q: <HCP-perspective question that strictly reflects article content>
                 if not seen_stems:
                     chosen.append(candidate); seen_stems.append(stem)
                     break
-                if util.cos_sim(embedder.encode(stem), embedder.encode(seen_stems)).max().item() < 0.90:
+                if util.cos_sim(get_embedder().encode(stem), get_embedder().encode(seen_stems)).max().item() < 0.90:
                     chosen.append(candidate); seen_stems.append(stem)
                     break
                 if len(chosen) >= MAX_POLLS_PER_ARTICLE:
@@ -613,14 +577,14 @@ Q: <HCP-perspective question that strictly reflects article content>
                 if p in chosen:
                     continue
                 stem = self._stem(p.splitlines()[0])
-                if util.cos_sim(embedder.encode(stem), embedder.encode(seen_stems)).max().item() < 0.90:
+                if util.cos_sim(get_embedder().encode(stem), get_embedder().encode(seen_stems)).max().item() < 0.90:
                     chosen.append(p); seen_stems.append(stem)
                 if len(chosen) >= MAX_POLLS_PER_ARTICLE:
                     break
 
         return chosen[:MAX_POLLS_PER_ARTICLE]
 
-    def generate(self, headline: str, url: str, grounding_text: str, facts: Dict,
+    def generate(self, headline: str, url: str, grounding_text: str, key_facts: Dict,
                  passes: int, temperature: float, top_p: float, max_new_tokens: int) -> List[str]:
 
         ready = any([self.wxa_model, self.hf_client, self.gen_pipeline])
@@ -637,7 +601,7 @@ Q: <HCP-perspective question that strictly reflects article content>
         for i in range(passes):
             try:
                 with st.spinner(f"Generating polls (pass {i+1}/{passes})..."):
-                    prompt = self._format_prompt(headline, url, grounding_text, facts)
+                    prompt = self._format_prompt(headline, url, grounding_text, key_facts)
 
                     if self.provider == "watsonx":
                         out = self._gen_watsonx(prompt, jitter_temp, jitter_top_p, max_new_tokens)
@@ -685,40 +649,6 @@ Q: <HCP-perspective question that strictly reflects article content>
         return self._select_diverse_top4(valid, embedder)
 
 # =========================
-# RULE-BASED FALLBACK (unchanged)
-# =========================
-def rule_based_polls(facts: Dict) -> List[str]:
-    polls: List[str] = []
-    def add(q, options):
-        block = "Q: " + q.strip()
-        opts = ["- " + o.strip() for o in options if o.strip()]
-        if len(opts) >= 3:
-            block = enforce_neutrality(block + "\n" + "\n".join(opts))
-            block = trim_to_limit(block, MAX_TWEET_CHARS)
-            polls.append(block)
-
-    drug, ind = facts.get("drug"), facts.get("indication")
-    if drug and ind:
-        add(
-            f"Is this information about {drug} for {ind} practice-changing for you?",
-            ["Practice-changing", "Practice-informing", "No impact", "Need more data"],
-        )
-        add(
-            f"Will you use {drug} for {ind} in your practice?",
-            ["Yes, broadly", "Yes, select patients", "Not now", "Awaiting guidelines"],
-        )
-        add(
-            f"For which {ind} patients would you consider {drug}?",
-            ["First-line", "Later-line", "Specific biomarker", "Not applicable"],
-        )
-        add(
-            f"Do these results change your treatment discussions?",
-            ["Significantly", "Somewhat", "Not really", "Unsure"],
-        )
-
-    return polls[:MAX_POLLS_PER_ARTICLE]
-
-# =========================
 # GROUNDING VALIDATION HELPERS
 # =========================
 def _chunk_text_for_similarity(text: str, chunk_size: int = 480, overlap: int = 120) -> List[str]:
@@ -743,54 +673,36 @@ def _contains_phrase(q: str, phrase: str) -> bool:
     pn = _normalize(phrase)
     return pn and pn in qn
 
-def _phase_normalize(p: Optional[str]) -> Optional[str]:
-    if not p:
-        return None
-    p = p.strip().lower()
-    p = re.sub(r"\bphase\s*([ivx]+)\b", lambda m: f"phase { {'i':1,'ii':2,'iii':3,'iv':4}.get(m.group(1).lower(),'') }", p)
-    p = re.sub(r"\bphase\s*(\d)\b", r"phase \1", p)
-    p = p.replace("  ", " ").strip()
-    return p if p else None
-
-def _entity_overlap_score(question_text: str, facts: Dict) -> float:
+def _entity_overlap_score(question_text: str, json_entities: Dict) -> float:
+    """
+    Weighted presence of key entities in the QUESTION (not options), using JSON only:
+      - drug_names (0.5)
+      - indications (0.3)
+      - trial_phases (0.2)
+    """
     q = _normalize(question_text)
-
     w_drug, w_ind, w_ph = 0.5, 0.3, 0.2
     total_w = 0.0
     score = 0.0
 
-    # DRUG
-    drugs = [d for d in (facts.get("drugs") or []) if isinstance(d, str) and d.strip()]
+    drugs = [d for d in (json_entities.get("drug_names") or []) if isinstance(d, str) and d.strip()]
     if drugs:
         total_w += w_drug
-        drug_present = any(_contains_phrase(q, d) for d in drugs)
-        if not drug_present and facts.get("drug"):
-            drug_present = _contains_phrase(q, facts["drug"])
-        if drug_present:
+        if any(_contains_phrase(q, d) for d in drugs):
             score += w_drug
 
-    # INDICATION
-    ind = facts.get("indication")
-    if ind:
+    inds = [i for i in (json_entities.get("indications") or []) if isinstance(i, str) and i.strip()]
+    if inds:
         total_w += w_ind
-        ind_present = _contains_phrase(q, ind)
-        if not ind_present:
-            key_bits = re.findall(r"[a-z0-9\+\-]+", _normalize(ind))
-            if key_bits:
-                ind_present = any(bit in q for bit in key_bits if len(bit) >= 4 or bit in {"her2","hr+","hr-","tnbc"})
-        if ind_present:
+        # Allow partial token overlap (e.g., "TNBC" / "triple-negative breast cancer")
+        present = any(_contains_phrase(q, ind) or "tnbc" in q for ind in inds)
+        if present:
             score += w_ind
 
-    # PHASE
-    ph = _phase_normalize(facts.get("phase"))
-    if ph:
+    phases = [p for p in (json_entities.get("trial_phases") or []) if isinstance(p, str) and p.strip()]
+    if phases:
         total_w += w_ph
-        present = _contains_phrase(q, ph)
-        if not present:
-            roman_map = {"1":"i","2":"ii","3":"iii","4":"iv"}
-            m = re.search(r"phase (\d)", ph)
-            if m and m.group(1) in roman_map:
-                present = _contains_phrase(q, f"phase {roman_map[m.group(1)]}")
+        present = any(_contains_phrase(q, p) or _contains_phrase(q, p.replace("Phase ", "")) for p in phases)
         if present:
             score += w_ph
 
@@ -810,101 +722,26 @@ def grounding_semantic_similarity(question_text: str, grounding_text: str, embed
     sims = util.cos_sim(q_emb, c_embs).cpu().numpy()[0]
     return float(np.max(sims))
 
-def grounding_overall_score(question_text: str, grounding_text: str, facts: Dict, embedder, entity_weight: float) -> Dict[str, float]:
+def grounding_overall_score(question_text: str, grounding_text: str, json_entities: Dict, embedder, entity_weight: float) -> Dict[str, float]:
     sem = grounding_semantic_similarity(question_text, grounding_text, embedder)  # 0..1
-    ent = _entity_overlap_score(question_text, facts)                              # 0..1
+    ent = _entity_overlap_score(question_text, json_entities)                     # 0..1
     overall = (1.0 - float(entity_weight)) * sem + float(entity_weight) * ent
     return {"semantic": sem, "entity": ent, "overall": overall}
 
 # =========================
-# PIPELINE (schema-aware)
+# PIPELINE (per article)
 # =========================
-def _coerce_list(x) -> List[str]:
-    if not x:
-        return []
-    if isinstance(x, list):
-        return [str(i).strip() for i in x if str(i).strip()]
-    return [str(x).strip()]
+def build_polls_for_article(adapted: Dict):
+    headline = adapted["headline"]
+    url = adapted["url"]
+    grounding_text = adapted["grounding_text"]
+    summary = adapted["summary"]
+    json_entities = adapted["entities"]
 
-def _adapt_article_schema(art: Dict) -> Tuple[str, str, str, str, List[str], List[str], str, List[str], List[str]]:
-    """
-    Returns:
-      headline, url, content, summary, companies, drugs, published_date, trial_names, trial_phases/indications
-    Note: trial_phases and indications are returned separately via another function to keep signature tidy.
-    """
-    # Core fields (fallbacks cover legacy + new)
-    headline = (art.get("headline") or art.get("title") or "").strip()
-    url = (art.get("url") or "").strip()
-    content = (art.get("content") or art.get("article") or "").strip()
-    summary = (art.get("summary_280") or art.get("summary_tweet") or art.get("summary") or "").strip()
-    published_date = (art.get("published_date") or art.get("date") or "").strip()
+    # Awareness poll based only on JSON entities
+    awareness = build_awareness_poll(json_entities)
 
-    # Legacy company/drug
-    companies = _coerce_list(art.get("companies"))
-    drugs = _coerce_list(art.get("drugs"))
-
-    # New entities block
-    entities = art.get("entities") or {}
-    # company_name could be a single string
-    ent_company = entities.get("company_name")
-    if ent_company:
-        companies = _coerce_list(ent_company) + [c for c in companies if c not in _coerce_list(ent_company)]
-    # drug_names is a list
-    ent_drugs = _coerce_list(entities.get("drug_names"))
-    if ent_drugs:
-        # prefer entity drugs first
-        drugs = ent_drugs + [d for d in drugs if d not in ent_drugs]
-
-    trial_names = _coerce_list(entities.get("trial_names"))
-    trial_phases = _coerce_list(entities.get("trial_phases"))
-    indications_list = _coerce_list(entities.get("indications"))
-
-    return headline, url, content, summary, companies, drugs, published_date, trial_names, trial_phases, indications_list
-
-def extract_facts_from_article(art: Dict):
-    # Map both schemas into a unified shape
-    (headline, url, content, summary, companies_in, drugs_in,
-     published_date, trial_names, trial_phases, indications_list) = _adapt_article_schema(art)
-
-    grounding_text = content if content else (headline + "\n\n" + summary)
-
-    facts = extract_facts_from_inputs(
-        headline=headline,
-        content_or_summary=grounding_text,
-        url=url,
-        companies_in=companies_in,
-        drugs_in=drugs_in,
-        indications_in=indications_list,
-        trial_phases_in=trial_phases,
-    )
-    # Return everything needed downstream
-    return {
-        "headline": headline,
-        "url": url,
-        "grounding_text": grounding_text,
-        "summary": summary,
-        "companies_in": companies_in,
-        "drugs_in": drugs_in,
-        "facts": facts,
-        "published_date": published_date,
-        "trial_names": trial_names,
-        "trial_phases": trial_phases,
-        "indications_list": indications_list,
-    }
-
-def build_polls_for_article(art: Dict):
-    data = extract_facts_from_article(art)
-    headline = data["headline"]
-    url = data["url"]
-    grounding_text = data["grounding_text"]
-    summary = data["summary"]
-    companies_in = data["companies_in"]
-    drugs_in = data["drugs_in"]
-    facts = data["facts"]
-
-    awareness = build_awareness_poll(facts)
-
-    # Pull creds already loaded above based on provider choice
+    # Model init
     if provider == "watsonx":
         wxa_api_key, wxa_url, wxa_project_or_space = get_watsonx_creds()
         miner = PollMiner(
@@ -920,12 +757,13 @@ def build_polls_for_article(art: Dict):
         )
 
     llm_polls = miner.generate(
-        headline, url, grounding_text, facts,
+        headline, url, grounding_text, json_entities,
         passes_per_article, temperature, top_p, max_new_tokens
     )
 
+    # Optional fallback
     if not llm_polls and allow_rule_fallback:
-        llm_polls = rule_based_polls(facts)
+        llm_polls = [awareness]  # keep simple if model is unavailable
 
     embedder = get_embedder()
     all_polls = [awareness] + llm_polls
@@ -943,24 +781,16 @@ def build_polls_for_article(art: Dict):
         if util.cos_sim(embedder.encode(stem), embedder.encode(stems)).max().item() < 0.90:
             final.append(p); stems.append(stem)
 
-    # === grounding scores for each final poll (question line only) ===
+    # Scores
     poll_scores: List[Dict] = []
     for poll in final:
         lines = [ln for ln in poll.splitlines() if ln.strip()]
         q_line = lines[0]
         question_text = re.sub(r"^Q\s*:\s*", "", q_line, flags=re.I).strip()
-        scores = grounding_overall_score(question_text, grounding_text, facts, embedder, entity_weight)
+        scores = grounding_overall_score(question_text, grounding_text, json_entities, embedder, entity_weight)
         poll_scores.append(scores)
 
-    # Bubble up additional new-schema fields to caller
-    extra = {
-        "published_date": data["published_date"],
-        "trial_names": data["trial_names"],
-        "trial_phases": data["trial_phases"],
-        "indications_list": data["indications_list"],
-    }
-
-    return final, poll_scores, facts, grounding_text, summary, companies_in, drugs_in, headline, url, extra
+    return final, poll_scores
 
 # =========================
 # FILE INPUTS
@@ -984,14 +814,37 @@ def load_json_any(source_file: Path) -> List[Dict]:
         raise ValueError("Input JSON must be a list of article dicts.")
     return data
 
-articles: List[Dict] = []
+def passes_date_filter(published_dt: Optional[datetime], month_choice: str, year_choice: str) -> bool:
+    # If no filters set, include all
+    if (month_choice == "All") and (not year_choice.strip()):
+        return True
+    # If no date parse, include only when filters are "All"
+    if not published_dt:
+        return False
+    m_ok = True
+    y_ok = True
+    if month_choice != "All":
+        month_map = {
+            "January":1,"February":2,"March":3,"April":4,"May":5,"June":6,
+            "July":7,"August":8,"September":9,"October":10,"November":11,"December":12
+        }
+        m_ok = (published_dt.month == month_map[month_choice])
+    if year_choice.strip():
+        try:
+            y = int(year_choice.strip())
+            y_ok = (published_dt.year == y)
+        except Exception:
+            y_ok = True  # ignore bad input
+    return m_ok and y_ok
+
+articles_raw: List[Dict] = []
 if run_btn:
     try:
         if uploaded is not None:
-            articles = json.load(uploaded)
+            articles_raw = json.load(uploaded)
         elif repo_pick != "(none)":
             chosen = APP_DIR / repo_pick
-            articles = load_json_any(chosen)
+            articles_raw = load_json_any(chosen)
         elif path_input.strip():
             p = Path(path_input)
             if not p.is_absolute():
@@ -999,296 +852,151 @@ if run_btn:
             if not p.exists():
                 st.error(f"Path not found: {p}")
             else:
-                articles = load_json_any(p)
+                articles_raw = load_json_any(p)
         else:
-            guesses = [
-                APP_DIR / "article_summaries_extractions.json",
-                APP_DIR / "twitter_polls_generated_v3.json",
-                APP_DIR / "breast_cancer_news_content.json",
-            ]
-            for g in guesses:
-                if g.exists():
-                    articles = load_json_any(g)
-                    st.info(f"Using default file: {g.name}")
-                    break
-            if not articles:
-                st.error("No input provided. Upload a file, pick one from the repo root, or enter a valid path.")
-        if articles and not isinstance(articles, list):
+            st.error("No input provided. Upload a file, pick one from the repo root, or enter a valid path.")
+        if articles_raw and not isinstance(articles_raw, list):
             st.error("Input JSON must be a list of article dicts.")
-            articles = []
+            articles_raw = []
     except Exception as e:
         st.exception(e)
-        articles = []
+        articles_raw = []
 
 # =========================
 # PROCESS & DISPLAY
 # =========================
 results = []
-if run_btn and articles:
-    # Validation (no key prompts in UI anymore)
-    if provider == "huggingface" and use_hf_inference and not get_hf_token():
-        st.error("Hugging Face selected but HF_TOKEN is missing from secrets/env.")
-    elif provider == "watsonx":
-        _api, _url, _sp = get_watsonx_creds()
-        if not (_api and _url and _sp):
-            st.error("watsonx selected but server-side credentials are missing (WATSONX_API_KEY/URL and Space or Project ID).")
-        else:
-            with st.spinner("Generating polls…"):
-                for idx, art in enumerate(articles, start=1):
-                    try:
-                        polls, poll_scores, facts, grounding_text, summary, companies_in, drugs_in, headline, url, extra = build_polls_for_article(art)
-                    except Exception as e:
-                        headline = (art.get("headline") or art.get("title") or "").strip()
-                        st.error(f"#{idx} {headline or '(no headline)'}: {e}")
-                        continue
+if run_btn and articles_raw:
+    # Adapt and filter by Month/Year
+    adapted_all: List[Dict] = [adapt_article_schema(art) for art in articles_raw]
+    adapted = [a for a in adapted_all if passes_date_filter(a["published_dt"], month_choice, year_choice)]
 
-                    published_date = extra.get("published_date") or ""
-                    trial_names = extra.get("trial_names") or []
-                    trial_phases = extra.get("trial_phases") or []
-                    indications_list = extra.get("indications_list") or []
-
-                    comment_key = f"comment-{idx}"
-                    st.session_state.setdefault(comment_key, "")
-                    with st.expander(f"#{idx}  {headline or '(no headline)'}", expanded=False):
-                        # Source + Published
-                        src_line = []
-                        if url:
-                            src_line.append(f"**Source:** [{url}]({url})")
-                        if published_date:
-                            src_line.append(f"**Published:** {published_date}")
-                        if src_line:
-                            st.markdown(" &nbsp; • &nbsp; ".join(src_line))
-
-                        col1, col2, col3 = st.columns([1.4, 1.2, 1.2])
-                        with col1:
-                            st.markdown("**Drugs/Products:** " + (", ".join(drugs_in) if drugs_in else (facts.get("drug") or "—")))
-                            st.markdown("**Indication (primary):** " + (facts.get("indication") or "—"))
-                            if indications_list:
-                                st.caption("Other indications: " + ", ".join(indications_list))
-                        with col2:
-                            st.markdown("**Publisher (from URL):** " + (facts.get("publisher") or "—"))
-                            st.markdown("**Company:** " + (", ".join(companies_in) if companies_in else (", ".join(facts.get("companies", [])) or "—")))
-                            st.markdown("**Phase (primary):** " + (facts.get("phase") or "—"))
-                            if trial_phases:
-                                st.caption("Trial phases: " + ", ".join(trial_phases))
-                        with col3:
-                            ts = [k for k, v in facts.get("topics", {}).items() if v]
-                            st.markdown("**Topics:** " + (", ".join(ts) if ts else "—"))
-                            if trial_names:
-                                st.markdown("**Trials:** " + ", ".join(trial_names))
-
-                        # Summary / Content preview
-                        if summary:
-                            st.markdown("**Summary:**")
-                            st.markdown("> " + summary.replace("\n", " "))
-                        elif grounding_text:
-                            preview = grounding_text.strip()
-                            if len(preview) > 600:
-                                preview = preview[:600] + "…"
-                            st.markdown("> " + preview.replace("\n", " "))
-
-                        st.markdown("---")
-                        st.subheader("Generated Polls (max 4)")
-                        if not polls:
-                            st.info("No unique polls were generated for this article.")
-                            selected_answers = {}
-                        else:
-                            # Collect selected answers for this article
-                            selected_answers = {}
-                            for i, poll in enumerate(polls, start=1):
-                                lines = [ln for ln in poll.splitlines() if ln.strip()]
-                                if not lines:
-                                    continue
-                                q = lines[0].replace("Q:", "").strip()
-                                opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
-
-                                # grounding scores & flag
-                                sc = poll_scores[i-1] if i-1 < len(poll_scores) else {"semantic": 0.0, "entity": 0.0, "overall": 0.0}
-                                needs_review = sc["overall"] < grounding_threshold
-                                badge = f"Score: **{sc['overall']:.2f}**  (semantic {sc['semantic']:.2f} · entity {sc['entity']:.2f})"
-                                flag = " ⚠️ Needs review" if needs_review else " ✅ Grounded"
-                                st.markdown(f"**Q{i}. {q}**  &nbsp;&nbsp; {badge}{flag}")
-
-                                with st.container():
-                                    answer_key = f"{idx}-{i}"
-                                    selected_answer = st.radio(
-                                        label=" ",
-                                        options=opts or ["(no options)"],
-                                        index=None,
-                                        key=answer_key
-                                    )
-                                    selected_answers[f"poll_{i}"] = {
-                                        "question": q,
-                                        "selected_answer": selected_answer if selected_answer else "Not answered",
-                                        "options": opts,
-                                        "grounding_score": {
-                                            "overall": round(sc["overall"], 4),
-                                            "semantic": round(sc["semantic"] ,4),
-                                            "entity": round(sc["entity"], 4),
-                                            "threshold": grounding_threshold,
-                                            "needs_review": needs_review,
-                                        }
-                                    }
-                                st.markdown("")
-
-                        st.markdown("---")
-                        st.text_area("Optional HCP comment (will be exported)", key=comment_key, height=100)
-
-                    # Save result with the new fields included
-                    results.append({
-                        "headline": headline,
-                        "url": url,
-                        "published_date": published_date,
-                        "polls": polls,
-                        "selected_answers": selected_answers,
-                        "comment": st.session_state.get(comment_key, ""),
-                        "companies": companies_in,
-                        "drugs": drugs_in,
-                        "summary": summary,
-                        "entities": {
-                            "trial_names": trial_names,
-                            "trial_phases": trial_phases,
-                            "indications": indications_list
-                        }
-                    })
-
-            st.markdown("---")
-            st.subheader("⬇️ Download")
-            out_json = json.dumps(results, ensure_ascii=False, indent=2)
-            st.download_button(
-                "Download results as JSON",
-                data=out_json.encode("utf-8"),
-                file_name="twitter_polls_generated.json",
-                mime="application/json",
-            )
+    if not adapted:
+        st.info("No articles matched the Month/Year filters.")
     else:
-        # Hugging Face path (if selected and token exists)
-        if provider == "huggingface" and get_hf_token():
-            with st.spinner("Generating polls…"):
-                for idx, art in enumerate(articles, start=1):
-                    try:
-                        polls, poll_scores, facts, grounding_text, summary, companies_in, drugs_in, headline, url, extra = build_polls_for_article(art)
-                    except Exception as e:
-                        headline = (art.get("headline") or art.get("title") or "").strip()
-                        st.error(f"#{idx} {headline or '(no headline)'}: {e}")
-                        continue
+        if provider == "huggingface" and use_hf_inference and not get_hf_token():
+            st.error("Hugging Face selected but HF_TOKEN is missing from secrets/env.")
+        elif provider == "watsonx":
+            _api, _url, _sp = get_watsonx_creds()
+            if not (_api and _url and _sp):
+                st.error("watsonx selected but server-side credentials are missing (WATSONX_API_KEY/URL and Space or Project ID).")
+            else:
+                with st.spinner("Generating polls…"):
+                    for idx, a in enumerate(adapted, start=1):
+                        try:
+                            polls, poll_scores = build_polls_for_article(a)
+                        except Exception as e:
+                            st.error(f"#{idx} {a['headline'] or '(no headline)'}: {e}")
+                            continue
 
-                    published_date = extra.get("published_date") or ""
-                    trial_names = extra.get("trial_names") or []
-                    trial_phases = extra.get("trial_phases") or []
-                    indications_list = extra.get("indications_list") or []
+                        # UI — no headline truncation: print full headline inside expander
+                        comment_key = f"comment-{idx}"
+                        st.session_state.setdefault(comment_key, "")
+                        with st.expander(f"#{idx}  (open to view)", expanded=False):
+                            st.markdown(f"### 📰 Headline\n{a['headline'] or '—'}")
+                            # Source + Published
+                            src_line = []
+                            if a["url"]:
+                                src_line.append(f"**Source:** [{a['url']}]({a['url']})")
+                            if a["published_date"]:
+                                src_line.append(f"**Published:** {a['published_date']}")
+                            if src_line:
+                                st.markdown(" &nbsp; • &nbsp; ".join(src_line))
 
-                    comment_key = f"comment-{idx}"
-                    st.session_state.setdefault(comment_key, "")
-                    with st.expander(f"#{idx}  {headline or '(no headline)'}", expanded=False):
-                        src_line = []
-                        if url:
-                            src_line.append(f"**Source:** [{url}]({url})")
-                        if published_date:
-                            src_line.append(f"**Published:** {published_date}")
-                        if src_line:
-                            st.markdown(" &nbsp; • &nbsp; ".join(src_line))
+                            # Curated summary panel
+                            col1, col2, col3 = st.columns([1.4, 1.2, 1.2])
+                            ents = a["entities"]
+                            with col1:
+                                st.markdown("**Drugs/Products:** " + (", ".join(ents.get("drug_names") or []) or "—"))
+                                st.markdown("**Indications:** " + (", ".join(ents.get("indications") or []) or "—"))
+                            with col2:
+                                st.markdown("**Companies:** " + (", ".join(ents.get("company_name") or []) or "—"))
+                                st.markdown("**Trial phases:** " + (", ".join(ents.get("trial_phases") or []) or "—"))
+                            with col3:
+                                st.markdown("**Trials:** " + (", ".join(ents.get("trial_names") or []) or "—"))
+                                st.markdown("**Publisher (from URL):** " + (a.get("publisher") or "—"))
 
-                        col1, col2, col3 = st.columns([1.4, 1.2, 1.2])
-                        with col1:
-                            st.markdown("**Drugs/Products:** " + (", ".join(drugs_in) if drugs_in else (facts.get("drug") or "—")))
-                            st.markdown("**Indication (primary):** " + (facts.get("indication") or "—"))
-                            if indications_list:
-                                st.caption("Other indications: " + ", ".join(indications_list))
-                        with col2:
-                            st.markdown("**Publisher (from URL):** " + (facts.get("publisher") or "—"))
-                            st.markdown("**Company:** " + (", ".join(companies_in) if companies_in else (", ".join(facts.get("companies", [])) or "—")))
-                            st.markdown("**Phase (primary):** " + (facts.get("phase") or "—"))
-                            if trial_phases:
-                                st.caption("Trial phases: " + ", ".join(trial_phases))
-                        with col3:
-                            ts = [k for k, v in facts.get("topics", {}).items() if v]
-                            st.markdown("**Topics:** " + (", ".join(ts) if ts else "—"))
-                            if trial_names:
-                                st.markdown("**Trials:** " + ", ".join(trial_names))
+                            # Summary / Content preview (no truncation of headline)
+                            if a["summary"]:
+                                st.markdown("**Summary:**")
+                                st.markdown("> " + a["summary"].replace("\n", " "))
+                            elif a["content"]:
+                                preview = a["content"].strip()
+                                if len(preview) > 600:
+                                    preview = preview[:600] + "…"
+                                st.markdown("> " + preview.replace("\n", " "))
 
-                        if summary:
-                            st.markdown("**Summary:**")
-                            st.markdown("> " + summary.replace("\n", " "))
-                        elif grounding_text:
-                            preview = grounding_text.strip()
-                            if len(preview) > 600:
-                                preview = preview[:600] + "…"
-                            st.markdown("> " + preview.replace("\n", " "))
+                            st.markdown("---")
+                            st.subheader("Generated Polls (max 4)")
+                            if not polls:
+                                st.info("No unique polls were generated for this article.")
+                                selected_answers = {}
+                            else:
+                                selected_answers = {}
+                                for i, poll in enumerate(polls, start=1):
+                                    lines = [ln for ln in poll.splitlines() if ln.strip()]
+                                    if not lines:
+                                        continue
+                                    q = lines[0].replace("Q:", "").strip()
+                                    opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
 
-                        st.markdown("---")
-                        st.subheader("Generated Polls (max 4)")
-                        if not polls:
-                            st.info("No unique polls were generated for this article.")
-                            selected_answers = {}
-                        else:
-                            selected_answers = {}
-                            for i, poll in enumerate(polls, start=1):
-                                lines = [ln for ln in poll.splitlines() if ln.strip()]
-                                if not lines:
-                                    continue
-                                q = lines[0].replace("Q:", "").strip()
-                                opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
+                                    sc = poll_scores[i-1] if i-1 < len(poll_scores) else {"semantic": 0.0, "entity": 0.0, "overall": 0.0}
+                                    needs_review = sc["overall"] < grounding_threshold
+                                    badge = f"Score: **{sc['overall']:.2f}**  (semantic {sc['semantic']:.2f} · entity {sc['entity']:.2f})"
+                                    flag = " ⚠️ Needs review" if needs_review else " ✅ Grounded"
+                                    st.markdown(f"**Q{i}. {q}**  &nbsp;&nbsp; {badge}{flag}")
 
-                                sc = poll_scores[i-1] if i-1 < len(poll_scores) else {"semantic": 0.0, "entity": 0.0, "overall": 0.0}
-                                needs_review = sc["overall"] < grounding_threshold
-                                badge = f"Score: **{sc['overall']:.2f}**  (semantic {sc['semantic']:.2f} · entity {sc['entity']:.2f})"
-                                flag = " ⚠️ Needs review" if needs_review else " ✅ Grounded"
-                                st.markdown(f"**Q{i}. {q}**  &nbsp;&nbsp; {badge}{flag}")
-
-                                with st.container():
-                                    answer_key = f"{idx}-{i}"
-                                    selected_answer = st.radio(
-                                        label=" ",
-                                        options=opts or ["(no options)"],
-                                        index=None,
-                                        key=answer_key
-                                    )
-                                    selected_answers[f"poll_{i}"] = {
-                                        "question": q,
-                                        "selected_answer": selected_answer if selected_answer else "Not answered",
-                                        "options": opts,
-                                        "grounding_score": {
-                                            "overall": round(sc["overall"], 4),
-                                            "semantic": round(sc["semantic"] ,4),
-                                            "entity": round(sc["entity"], 4),
-                                            "threshold": grounding_threshold,
-                                            "needs_review": needs_review,
+                                    with st.container():
+                                        answer_key = f"{idx}-{i}"
+                                        selected_answer = st.radio(
+                                            label=" ",
+                                            options=opts or ["(no options)"],
+                                            index=None,
+                                            key=answer_key
+                                        )
+                                        selected_answers[f"poll_{i}"] = {
+                                            "question": q,
+                                            "selected_answer": selected_answer if selected_answer else "Not answered",
+                                            "options": opts,
+                                            "grounding_score": {
+                                                "overall": round(sc["overall"], 4),
+                                                "semantic": round(sc["semantic"], 4),
+                                                "entity": round(sc["entity"], 4),
+                                                "threshold": grounding_threshold,
+                                                "needs_review": needs_review,
+                                            }
                                         }
-                                    }
-                                st.markdown("")
-                        st.markdown("---")
-                        st.text_area("Optional HCP comment (will be exported)", key=comment_key, height=100)
+                                    st.markdown("")
 
-                    results.append({
-                        "headline": headline,
-                        "url": url,
-                        "published_date": published_date,
-                        "polls": polls,
-                        "selected_answers": selected_answers,
-                        "comment": st.session_state.get(comment_key, ""),
-                        "companies": companies_in,
-                        "drugs": drugs_in,
-                        "summary": summary,
-                        "entities": {
-                            "trial_names": trial_names,
-                            "trial_phases": trial_phases,
-                            "indications": indications_list
-                        }
-                    })
+                            st.markdown("---")
+                            st.subheader("Raw JSON (article)")
+                            st.json(a["raw"])  # show every field present in input JSON
 
-            st.markdown("---")
-            st.subheader("⬇️ Download")
-            out_json = json.dumps(results, ensure_ascii=False, indent=2)
-            st.download_button(
-                "Download results as JSON",
-                data=out_json.encode("utf-8"),
-                file_name="twitter_polls_generated.json",
-                mime="application/json",
-            )
+                            st.text_area("Optional HCP comment (will be exported)", key=comment_key, height=100)
+
+                        results.append({
+                            "headline": a["headline"],
+                            "url": a["url"],
+                            "published_date": a["published_date"],
+                            "polls": polls,
+                            "selected_answers": selected_answers,
+                            "comment": st.session_state.get(comment_key, ""),
+                            "entities": a["entities"],
+                            "summary": a["summary"],
+                        })
+
+                st.markdown("---")
+                st.subheader("⬇️ Download")
+                out_json = json.dumps(results, ensure_ascii=False, indent=2)
+                st.download_button(
+                    "Download results as JSON",
+                    data=out_json.encode("utf-8"),
+                    file_name="twitter_polls_generated.json",
+                    mime="application/json",
+                )
 
 st.markdown("---")
 st.caption(
-    "Now supports new input schema: published_date + entities (drug_names, company_name, trial_names, trial_phases, indications). "
-    "If polls look truncated, raise 'Max new tokens per pass'."
+    "Reads JSON as-is (no entity inference). Questions are generated from content; all original fields are displayed. "
+    "Use the Month & Year filters in the sidebar."
 )
