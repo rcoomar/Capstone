@@ -348,8 +348,41 @@ def adapt_article_schema(art: Dict) -> Dict:
         },
         "publisher": publisher,
         "grounding_text": grounding_text,
-        "raw": art,  # keep original for display
+        "raw": art,  # keep original for display (not shown in UI anymore)
     }
+
+# =========================
+# DISPLAY HELPERS (Primary indication / Other terms)
+# =========================
+def split_primary_and_other(entities: Dict) -> Tuple[Optional[str], List[str]]:
+    """
+    Primary indication = first item in entities['indications'] (if present).
+    Other terms = everything else from entities (drugs, companies, remaining indications,
+                  trial phases, trial names) de-duplicated, excluding the primary.
+    """
+    def _clean_list(x):
+        if not x: return []
+        return [str(v).strip() for v in x if str(v).strip()]
+
+    inds = _clean_list(entities.get("indications"))
+    primary = inds[0] if inds else None
+
+    other_terms: List[str] = []
+    seen = set()
+
+    def add(vals):
+        for v in _clean_list(vals):
+            if v != primary and v not in seen:
+                seen.add(v)
+                other_terms.append(v)
+
+    add(entities.get("drug_names"))
+    add(entities.get("company_name"))
+    add(inds[1:])  # remaining indications
+    add(entities.get("trial_phases"))
+    add(entities.get("trial_names"))
+
+    return primary, other_terms
 
 # =========================
 # AWARENESS POLL (light-touch, JSON-only)
@@ -694,7 +727,6 @@ def _entity_overlap_score(question_text: str, json_entities: Dict) -> float:
     inds = [i for i in (json_entities.get("indications") or []) if isinstance(i, str) and i.strip()]
     if inds:
         total_w += w_ind
-        # Allow partial token overlap (e.g., "TNBC" / "triple-negative breast cancer")
         present = any(_contains_phrase(q, ind) or "tnbc" in q for ind in inds)
         if present:
             score += w_ind
@@ -903,16 +935,21 @@ if run_btn and articles_raw:
                             if src_line:
                                 st.markdown(" &nbsp; • &nbsp; ".join(src_line))
 
-                            # Curated summary panel
+                            # Curated summary panel with Primary indication / Other terms
                             col1, col2, col3 = st.columns([1.4, 1.2, 1.2])
                             ents = a["entities"]
+                            primary_ind, other_terms = split_primary_and_other(ents)
+
                             with col1:
-                                st.markdown("**Drugs/Products:** " + (", ".join(ents.get("drug_names") or []) or "—"))
-                                st.markdown("**Indications:** " + (", ".join(ents.get("indications") or []) or "—"))
+                                st.markdown("**Primary indication:** " + (primary_ind or "—"))
+                                st.markdown("**Other terms:** " + (", ".join(other_terms) or "—"))
+
                             with col2:
+                                st.markdown("**Drugs/Products:** " + (", ".join(ents.get("drug_names") or []) or "—"))
                                 st.markdown("**Companies:** " + (", ".join(ents.get("company_name") or []) or "—"))
-                                st.markdown("**Trial phases:** " + (", ".join(ents.get("trial_phases") or []) or "—"))
+
                             with col3:
+                                st.markdown("**Trial phases:** " + (", ".join(ents.get("trial_phases") or []) or "—"))
                                 st.markdown("**Trials:** " + (", ".join(ents.get("trial_names") or []) or "—"))
                                 st.markdown("**Publisher (from URL):** " + (a.get("publisher") or "—"))
 
@@ -968,10 +1005,6 @@ if run_btn and articles_raw:
                                         }
                                     st.markdown("")
 
-                            st.markdown("---")
-                            st.subheader("Raw JSON (article)")
-                            st.json(a["raw"])  # show every field present in input JSON
-
                             st.text_area("Optional HCP comment (will be exported)", key=comment_key, height=100)
 
                         results.append({
@@ -997,6 +1030,6 @@ if run_btn and articles_raw:
 
 st.markdown("---")
 st.caption(
-    "Reads JSON as-is (no entity inference). Questions are generated from content; all original fields are displayed. "
+    "Reads JSON as-is (no entity inference). Questions are generated from content. "
     "Use the Month & Year filters in the sidebar."
 )
