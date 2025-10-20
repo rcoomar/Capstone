@@ -108,6 +108,20 @@ with st.sidebar:
     st.markdown("---")
     st.caption("Input defaults to `article_summaries_extractions.json` (headline/url/summary_tweet/companies/drugs).")
 
+    # --- Grounding validation controls ---
+    st.markdown("---")
+    st.subheader("Grounding validation")
+    grounding_threshold = st.slider(
+        "Flag threshold (overall grounding)",
+        0.50, 0.99, 0.75, 0.01,
+        help="Questions scoring below this will be flagged for human review."
+    )
+    entity_weight = st.slider(
+        "Entity weight in overall score",
+        0.0, 1.0, 0.30, 0.05,
+        help="Overall = (1 - weight) * semantic_similarity + weight * entity_overlap"
+    )
+
 # Authenticate HF (server-side only; no user prompt)
 if provider == "huggingface" and hf_token:
     try:
@@ -702,6 +716,124 @@ def rule_based_polls(facts: Dict) -> List[str]:
     return polls[:MAX_POLLS_PER_ARTICLE]
 
 # =========================
+# GROUNDING VALIDATION HELPERS (NEW)
+# =========================
+def _chunk_text_for_similarity(text: str, chunk_size: int = 480, overlap: int = 120) -> List[str]:
+    """
+    Split long grounding text into overlapping chunks so we can measure
+    max similarity of Q against any chunk (prevents length dilution).
+    """
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= chunk_size:
+        return [text] if text else []
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + chunk_size)
+        chunks.append(text[start:end])
+        if end == len(text):
+            break
+        start = max(end - overlap, start + 1)
+    return chunks
+
+def _normalize(txt: str) -> str:
+    return re.sub(r"\s+", " ", (txt or "").strip().lower())
+
+def _contains_phrase(q: str, phrase: str) -> bool:
+    """Case-insensitive substring check with basic normalization."""
+    qn = _normalize(q)
+    pn = _normalize(phrase)
+    return pn and pn in qn
+
+def _phase_normalize(p: Optional[str]) -> Optional[str]:
+    if not p:
+        return None
+    p = p.strip().lower()
+    p = re.sub(r"\bphase\s*([ivx]+)\b", lambda m: f"phase { {'i':1,'ii':2,'iii':3,'iv':4}.get(m.group(1).lower(),'') }", p)
+    p = re.sub(r"\bphase\s*(\d)\b", r"phase \1", p)
+    p = p.replace("  ", " ").strip()
+    return p if p else None
+
+def _entity_overlap_score(question_text: str, facts: Dict) -> float:
+    """
+    Weighted presence of key entities in the QUESTION (not options):
+      - drug (0.5)
+      - indication (0.3)
+      - phase (0.2)
+    We only divide by the weights of entities that actually exist in the article facts.
+    """
+    q = _normalize(question_text)
+
+    w_drug, w_ind, w_ph = 0.5, 0.3, 0.2
+    total_w = 0.0
+    score = 0.0
+
+    # DRUG
+    drugs = [d for d in (facts.get("drugs") or []) if isinstance(d, str) and d.strip()]
+    if drugs:
+        total_w += w_drug
+        drug_present = any(_contains_phrase(q, d) for d in drugs)
+        if not drug_present and facts.get("drug"):
+            drug_present = _contains_phrase(q, facts["drug"])
+        if drug_present:
+            score += w_drug
+
+    # INDICATION
+    ind = facts.get("indication")
+    if ind:
+        total_w += w_ind
+        ind_present = _contains_phrase(q, ind)
+        if not ind_present:
+            key_bits = re.findall(r"[a-z0-9\+\-]+", _normalize(ind))
+            if key_bits:
+                ind_present = any(bit in q for bit in key_bits if len(bit) >= 4 or bit in {"her2","hr+","hr-","tnbc"})
+        if ind_present:
+            score += w_ind
+
+    # PHASE
+    ph = _phase_normalize(facts.get("phase"))
+    if ph:
+        total_w += w_ph
+        present = _contains_phrase(q, ph)
+        if not present:
+            roman_map = {"1":"i","2":"ii","3":"iii","4":"iv"}
+            m = re.search(r"phase (\d)", ph)
+            if m and m.group(1) in roman_map:
+                present = _contains_phrase(q, f"phase {roman_map[m.group(1)]}")
+        if present:
+            score += w_ph
+
+    if total_w == 0.0:
+        # No entities available to check → neutral mid score
+        return 0.5
+    return score / total_w
+
+def grounding_semantic_similarity(question_text: str, grounding_text: str, embedder) -> float:
+    """
+    Semantic: max cosine between QUESTION and any chunk of the grounding text.
+    """
+    q = question_text.strip()
+    if not q or not grounding_text:
+        return 0.0
+    q_emb = embedder.encode([q], normalize_embeddings=True)
+    chunks = _chunk_text_for_similarity(grounding_text, chunk_size=480, overlap=120)
+    if not chunks:
+        return 0.0
+    c_embs = embedder.encode(chunks, normalize_embeddings=True)
+    sims = util.cos_sim(q_emb, c_embs).cpu().numpy()[0]
+    return float(np.max(sims))
+
+def grounding_overall_score(question_text: str, grounding_text: str, facts: Dict, embedder, entity_weight: float) -> Dict[str, float]:
+    """
+    Overall = (1 - entity_weight) * semantic + entity_weight * entity_overlap
+    Returns dict with components for display + JSON export.
+    """
+    sem = grounding_semantic_similarity(question_text, grounding_text, embedder)  # 0..1
+    ent = _entity_overlap_score(question_text, facts)                              # 0..1
+    overall = (1.0 - float(entity_weight)) * sem + float(entity_weight) * ent
+    return {"semantic": sem, "entity": ent, "overall": overall}
+
+# =========================
 # PIPELINE (one article)
 # =========================
 def extract_facts_from_article(art: Dict):
@@ -768,7 +900,16 @@ def build_polls_for_article(art: Dict):
         if util.cos_sim(embedder.encode(stem), embedder.encode(stems)).max().item() < 0.90:
             final.append(p); stems.append(stem)
 
-    return final, facts, grounding_text, summary_tweet, companies_in, drugs_in, headline, url
+    # === NEW: compute grounding scores for each final poll (question line only) ===
+    poll_scores: List[Dict] = []
+    for poll in final:
+        lines = [ln for ln in poll.splitlines() if ln.strip()]
+        q_line = lines[0]
+        question_text = re.sub(r"^Q\s*:\s*", "", q_line, flags=re.I).strip()
+        scores = grounding_overall_score(question_text, grounding_text, facts, embedder, entity_weight)
+        poll_scores.append(scores)
+
+    return final, poll_scores, facts, grounding_text, summary_tweet, companies_in, drugs_in, headline, url
 
 # =========================
 # FILE INPUTS
@@ -845,7 +986,7 @@ if run_btn and articles:
             with st.spinner("Generating polls…"):
                 for idx, art in enumerate(articles, start=1):
                     try:
-                        polls, facts, grounding_text, summary_tweet, companies_in, drugs_in, headline, url = build_polls_for_article(art)
+                        polls, poll_scores, facts, grounding_text, summary_tweet, companies_in, drugs_in, headline, url = build_polls_for_article(art)
                     except Exception as e:
                         headline = (art.get("headline") or "").strip()
                         st.error(f"#{idx} {headline or '(no headline)'}: {e}")
@@ -882,16 +1023,44 @@ if run_btn and articles:
                         st.subheader("Generated Polls (max 4)")
                         if not polls:
                             st.info("No unique polls were generated for this article.")
+                            selected_answers = {}
                         else:
+                            # Collect selected answers for this article
+                            selected_answers = {}
                             for i, poll in enumerate(polls, start=1):
                                 lines = [ln for ln in poll.splitlines() if ln.strip()]
                                 if not lines:
                                     continue
                                 q = lines[0].replace("Q:", "").strip()
                                 opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
+
+                                # --- NEW: display grounding scores & flag ---
+                                sc = poll_scores[i-1] if i-1 < len(poll_scores) else {"semantic": 0.0, "entity": 0.0, "overall": 0.0}
+                                needs_review = sc["overall"] < grounding_threshold
+                                badge = f"Score: **{sc['overall']:.2f}**  (semantic {sc['semantic']:.2f} · entity {sc['entity']:.2f})"
+                                flag = " ⚠️ Needs review" if needs_review else " ✅ Grounded"
+                                st.markdown(f"**Q{i}. {q}**  &nbsp;&nbsp; {badge}{flag}")
+
                                 with st.container():
-                                    st.markdown(f"**Q{i}. {q}**")
-                                    st.radio(label=" ", options=opts or ["(no options)"], index=None, key=f"{idx}-{i}", disabled=True)
+                                    answer_key = f"{idx}-{i}"
+                                    selected_answer = st.radio(
+                                        label=" ",
+                                        options=opts or ["(no options)"],
+                                        index=None,
+                                        key=answer_key
+                                    )
+                                    selected_answers[f"poll_{i}"] = {
+                                        "question": q,
+                                        "selected_answer": selected_answer if selected_answer else "Not answered",
+                                        "options": opts,
+                                        "grounding_score": {
+                                            "overall": round(sc["overall"], 4),
+                                            "semantic": round(sc["semantic"], 4),
+                                            "entity": round(sc["entity"], 4),
+                                            "threshold": grounding_threshold,
+                                            "needs_review": needs_review,
+                                        }
+                                    }
                                 st.markdown("")
 
                         st.markdown("---")
@@ -901,6 +1070,7 @@ if run_btn and articles:
                         "headline": headline,
                         "url": url,
                         "polls": polls,
+                        "selected_answers": selected_answers,  # Store user selections + scores
                         "comment": st.session_state.get(comment_key, ""),
                         "companies": companies_in,
                         "drugs": drugs_in,
@@ -922,7 +1092,7 @@ if run_btn and articles:
             with st.spinner("Generating polls…"):
                 for idx, art in enumerate(articles, start=1):
                     try:
-                        polls, facts, grounding_text, summary_tweet, companies_in, drugs_in, headline, url = build_polls_for_article(art)
+                        polls, poll_scores, facts, grounding_text, summary_tweet, companies_in, drugs_in, headline, url = build_polls_for_article(art)
                     except Exception as e:
                         headline = (art.get("headline") or "").strip()
                         st.error(f"#{idx} {headline or '(no headline)'}: {e}")
@@ -957,16 +1127,44 @@ if run_btn and articles:
                         st.subheader("Generated Polls (max 4)")
                         if not polls:
                             st.info("No unique polls were generated for this article.")
+                            selected_answers = {}
                         else:
+                            # Collect selected answers for this article
+                            selected_answers = {}
                             for i, poll in enumerate(polls, start=1):
                                 lines = [ln for ln in poll.splitlines() if ln.strip()]
                                 if not lines:
                                     continue
                                 q = lines[0].replace("Q:", "").strip()
                                 opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
+
+                                # --- NEW: display grounding scores & flag ---
+                                sc = poll_scores[i-1] if i-1 < len(poll_scores) else {"semantic": 0.0, "entity": 0.0, "overall": 0.0}
+                                needs_review = sc["overall"] < grounding_threshold
+                                badge = f"Score: **{sc['overall']:.2f}**  (semantic {sc['semantic']:.2f} · entity {sc['entity']:.2f})"
+                                flag = " ⚠️ Needs review" if needs_review else " ✅ Grounded"
+                                st.markdown(f"**Q{i}. {q}**  &nbsp;&nbsp; {badge}{flag}")
+
                                 with st.container():
-                                    st.markdown(f"**Q{i}. {q}**")
-                                    st.radio(label=" ", options=opts or ["(no options)"], index=None, key=f"{idx}-{i}", disabled=True)
+                                    answer_key = f"{idx}-{i}"
+                                    selected_answer = st.radio(
+                                        label=" ",
+                                        options=opts or ["(no options)"],
+                                        index=None,
+                                        key=answer_key
+                                    )
+                                    selected_answers[f"poll_{i}"] = {
+                                        "question": q,
+                                        "selected_answer": selected_answer if selected_answer else "Not answered",
+                                        "options": opts,
+                                        "grounding_score": {
+                                            "overall": round(sc["overall"], 4),
+                                            "semantic": round(sc["semantic"], 4),
+                                            "entity": round(sc["entity"], 4),
+                                            "threshold": grounding_threshold,
+                                            "needs_review": needs_review,
+                                        }
+                                    }
                                 st.markdown("")
                         st.markdown("---")
                         st.text_area("Optional HCP comment (will be exported)", key=comment_key, height=100)
@@ -975,6 +1173,7 @@ if run_btn and articles:
                         "headline": headline,
                         "url": url,
                         "polls": polls,
+                        "selected_answers": selected_answers,  # Store user selections + scores
                         "comment": st.session_state.get(comment_key, ""),
                         "companies": companies_in,
                         "drugs": drugs_in,
