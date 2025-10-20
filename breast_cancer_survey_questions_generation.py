@@ -792,6 +792,14 @@ def load_json_any(source_file: Path) -> List[Dict]:
         raise ValueError("Input JSON must be a list of article dicts.")
     return data
 
+# Initialize session state for storing generated polls
+if 'generated_polls' not in st.session_state:
+    st.session_state.generated_polls = []
+
+if 'articles_data' not in st.session_state:
+    st.session_state.articles_data = []
+
+# Load articles
 articles: List[Dict] = []
 if run_btn:
     try:
@@ -833,7 +841,9 @@ if run_btn:
 # PROCESS & DISPLAY
 # =========================
 results = []
-if run_btn and articles:
+
+# Generate polls only when the button is clicked and store in session state
+if run_btn and articles and not st.session_state.generated_polls:
     # Validation (no key prompts in UI anymore)
     if provider == "huggingface" and use_hf_inference and not get_hf_token():
         st.error("Hugging Face selected but HF_TOKEN is missing from secrets/env.")
@@ -851,179 +861,138 @@ if run_btn and articles:
                         st.error(f"#{idx} {headline or '(no headline)'}: {e}")
                         continue
 
-                    comment_key = f"comment-{idx}"
-                    st.session_state.setdefault(comment_key, "")
-                    with st.expander(f"#{idx}  {headline or '(no headline)'}", expanded=False):
-                        if url:
-                            st.markdown(f"**Source:** [{url}]({url})")
-
-                        col1, col2, col3 = st.columns([1.2, 1, 1])
-                        with col1:
-                            st.markdown("**Drugs/Products:** " + (", ".join(drugs_in) if drugs_in else (facts.get("drug") or "—")))
-                            st.markdown("**Indication:** " + (facts.get("indication") or "—"))
-                            st.markdown("**Phase:** " + (facts.get("phase") or "—"))
-                        with col2:
-                            st.markdown("**Publisher:** " + (facts.get("publisher") or "—"))
-                            st.markdown("**Companies:** " + (", ".join(companies_in) if companies_in else (", ".join(facts.get("companies", [])) or "—")))
-                        with col3:
-                            ts = [k for k, v in facts.get("topics", {}).items() if v]
-                            st.markdown("**Topics:** " + (", ".join(ts) if ts else "—"))
-
-                        if summary_tweet:
-                            st.markdown("**Summary (tweet):**")
-                            st.markdown("> " + summary_tweet.replace("\n", " "))
-                        elif grounding_text:
-                            preview = grounding_text.strip()
-                            if len(preview) > 600:
-                                preview = preview[:600] + "…"
-                            st.markdown("> " + preview.replace("\n", " "))
-
-                        st.markdown("---")
-                        st.subheader("Generated Polls (max 4)")
-                        if not polls:
-                            st.info("No unique polls were generated for this article.")
-                        else:
-                            # Collect selected answers for this article
-                            selected_answers = {}
-                            
-                            for i, poll in enumerate(polls, start=1):
-                                lines = [ln for ln in poll.splitlines() if ln.strip()]
-                                if not lines:
-                                    continue
-                                q = lines[0].replace("Q:", "").strip()
-                                opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
-                                with st.container():
-                                    st.markdown(f"**Q{i}. {q}**")
-                                    # ENABLED: Users can now select answers
-                                    answer_key = f"{idx}-{i}"
-                                    selected_answer = st.radio(
-                                        label=" ", 
-                                        options=opts or ["(no options)"], 
-                                        index=None, 
-                                        key=answer_key
-                                    )
-                                    # Store the selected answer
-                                    selected_answers[f"poll_{i}"] = {
-                                        "question": q,
-                                        "selected_answer": selected_answer if selected_answer else "Not answered",
-                                        "options": opts
-                                    }
-                                st.markdown("")
-
-                        st.markdown("---")
-                        st.text_area("Optional HCP comment (will be exported)", key=comment_key, height=100)
-
-                    results.append({
+                    # Store results in session state
+                    result_data = {
                         "headline": headline,
                         "url": url,
                         "polls": polls,
-                        "selected_answers": selected_answers,  # Store user selections
-                        "comment": st.session_state.get(comment_key, ""),
-                        "companies": companies_in,
-                        "drugs": drugs_in,
+                        "facts": facts,
+                        "grounding_text": grounding_text,
                         "summary_tweet": summary_tweet,
-                    })
+                        "companies_in": companies_in,
+                        "drugs_in": drugs_in,
+                        "selected_answers": {},  # Initialize empty for answers
+                        "comment": ""
+                    }
+                    st.session_state.generated_polls.append(result_data)
+
+# Display generated polls from session state
+if st.session_state.generated_polls:
+    st.success(f"✅ Generated polls for {len(st.session_state.generated_polls)} articles")
+    
+    for idx, result_data in enumerate(st.session_state.generated_polls, start=1):
+        headline = result_data["headline"]
+        url = result_data["url"]
+        polls = result_data["polls"]
+        facts = result_data["facts"]
+        companies_in = result_data["companies_in"]
+        drugs_in = result_data["drugs_in"]
+        summary_tweet = result_data["summary_tweet"]
+        grounding_text = result_data["grounding_text"]
+
+        comment_key = f"comment-{idx}"
+        if comment_key not in st.session_state:
+            st.session_state[comment_key] = ""
+
+        with st.expander(f"#{idx}  {headline or '(no headline)'}", expanded=False):
+            if url:
+                st.markdown(f"**Source:** [{url}]({url})")
+
+            col1, col2, col3 = st.columns([1.2, 1, 1])
+            with col1:
+                st.markdown("**Drugs/Products:** " + (", ".join(drugs_in) if drugs_in else (facts.get("drug") or "—")))
+                st.markdown("**Indication:** " + (facts.get("indication") or "—"))
+                st.markdown("**Phase:** " + (facts.get("phase") or "—"))
+            with col2:
+                st.markdown("**Publisher:** " + (facts.get("publisher") or "—"))
+                st.markdown("**Companies:** " + (", ".join(companies_in) if companies_in else (", ".join(facts.get("companies", [])) or "—")))
+            with col3:
+                ts = [k for k, v in facts.get("topics", {}).items() if v]
+                st.markdown("**Topics:** " + (", ".join(ts) if ts else "—"))
+
+            if summary_tweet:
+                st.markdown("**Summary (tweet):**")
+                st.markdown("> " + summary_tweet.replace("\n", " "))
+            elif grounding_text:
+                preview = grounding_text.strip()
+                if len(preview) > 600:
+                    preview = preview[:600] + "…"
+                st.markdown("> " + preview.replace("\n", " "))
 
             st.markdown("---")
-            st.subheader("⬇️ Download")
-            out_json = json.dumps(results, ensure_ascii=False, indent=2)
-            st.download_button(
-                "Download results as JSON",
-                data=out_json.encode("utf-8"),
-                file_name="twitter_polls_generated.json",
-                mime="application/json",
-            )
-    else:
-        # Hugging Face path (if selected and token exists)
-        if provider == "huggingface" and get_hf_token():
-            with st.spinner("Generating polls…"):
-                for idx, art in enumerate(articles, start=1):
-                    try:
-                        polls, facts, grounding_text, summary_tweet, companies_in, drugs_in, headline, url = build_polls_for_article(art)
-                    except Exception as e:
-                        headline = (art.get("headline") or "").strip()
-                        st.error(f"#{idx} {headline or '(no headline)'}: {e}")
+            st.subheader("Generated Polls (max 4)")
+            if not polls:
+                st.info("No unique polls were generated for this article.")
+            else:
+                # Collect selected answers for this article
+                selected_answers = {}
+                
+                for i, poll in enumerate(polls, start=1):
+                    lines = [ln for ln in poll.splitlines() if ln.strip()]
+                    if not lines:
                         continue
-
-                    comment_key = f"comment-{idx}"
-                    st.session_state.setdefault(comment_key, "")
-                    with st.expander(f"#{idx}  {headline or '(no headline)'}", expanded=False):
-                        if url:
-                            st.markdown(f"**Source:** [{url}]({url})")
-                        col1, col2, col3 = st.columns([1.2, 1, 1])
-                        with col1:
-                            st.markdown("**Drugs/Products:** " + (", ".join(drugs_in) if drugs_in else (facts.get("drug") or "—")))
-                            st.markdown("**Indication:** " + (facts.get("indication") or "—"))
-                            st.markdown("**Phase:** " + (facts.get("phase") or "—"))
-                        with col2:
-                            st.markdown("**Publisher:** " + (facts.get("publisher") or "—"))
-                            st.markdown("**Companies:** " + (", ".join(companies_in) if companies_in else (", ".join(facts.get("companies", [])) or "—")))
-                        with col3:
-                            ts = [k for k, v in facts.get("topics", {}).items() if v]
-                            st.markdown("**Topics:** " + (", ".join(ts) if ts else "—"))
-                        if summary_tweet:
-                            st.markdown("**Summary (tweet):**")
-                            st.markdown("> " + summary_tweet.replace("\n", " "))
-                        elif grounding_text:
-                            preview = grounding_text.strip()
-                            if len(preview) > 600:
-                                preview = preview[:600] + "…"
-                            st.markdown("> " + preview.replace("\n", " "))
-
-                        st.markdown("---")
-                        st.subheader("Generated Polls (max 4)")
-                        if not polls:
-                            st.info("No unique polls were generated for this article.")
-                        else:
-                            # Collect selected answers for this article
-                            selected_answers = {}
-                            
-                            for i, poll in enumerate(polls, start=1):
-                                lines = [ln for ln in poll.splitlines() if ln.strip()]
-                                if not lines:
-                                    continue
-                                q = lines[0].replace("Q:", "").strip()
-                                opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
-                                with st.container():
-                                    st.markdown(f"**Q{i}. {q}**")
-                                    # ENABLED: Users can now select answers
-                                    answer_key = f"{idx}-{i}"
-                                    selected_answer = st.radio(
-                                        label=" ", 
-                                        options=opts or ["(no options)"], 
-                                        index=None, 
-                                        key=answer_key
-                                    )
-                                    # Store the selected answer
-                                    selected_answers[f"poll_{i}"] = {
-                                        "question": q,
-                                        "selected_answer": selected_answer if selected_answer else "Not answered",
-                                        "options": opts
-                                    }
-                                st.markdown("")
-                        st.markdown("---")
-                        st.text_area("Optional HCP comment (will be exported)", key=comment_key, height=100)
-
-                    results.append({
-                        "headline": headline,
-                        "url": url,
-                        "polls": polls,
-                        "selected_answers": selected_answers,  # Store user selections
-                        "comment": st.session_state.get(comment_key, ""),
-                        "companies": companies_in,
-                        "drugs": drugs_in,
-                        "summary_tweet": summary_tweet,
-                    })
+                    q = lines[0].replace("Q:", "").strip()
+                    opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
+                    with st.container():
+                        st.markdown(f"**Q{i}. {q}**")
+                        # ENABLED: Users can now select answers
+                        answer_key = f"{idx}-{i}"
+                        selected_answer = st.radio(
+                            label=" ", 
+                            options=opts or ["(no options)"], 
+                            index=None, 
+                            key=answer_key
+                        )
+                        # Store the selected answer in session state
+                        if answer_key not in st.session_state:
+                            st.session_state[answer_key] = None
+                        
+                        # Update the selected answer when user interacts
+                        if selected_answer:
+                            st.session_state[answer_key] = selected_answer
+                        
+                        # Use the stored value for display
+                        current_answer = st.session_state[answer_key]
+                        selected_answers[f"poll_{i}"] = {
+                            "question": q,
+                            "selected_answer": current_answer if current_answer else "Not answered",
+                            "options": opts
+                        }
+                    st.markdown("")
 
             st.markdown("---")
-            st.subheader("⬇️ Download")
-            out_json = json.dumps(results, ensure_ascii=False, indent=2)
-            st.download_button(
-                "Download results as JSON",
-                data=out_json.encode("utf-8"),
-                file_name="twitter_polls_generated.json",
-                mime="application/json",
-            )
+            comment = st.text_area("Optional HCP comment (will be exported)", key=comment_key, height=100)
+            
+            # Update the result data with current selections
+            result_data["selected_answers"] = selected_answers
+            result_data["comment"] = comment
+
+            results.append({
+                "headline": headline,
+                "url": url,
+                "polls": polls,
+                "selected_answers": selected_answers,
+                "comment": comment,
+                "companies": companies_in,
+                "drugs": drugs_in,
+                "summary_tweet": summary_tweet,
+            })
+
+    st.markdown("---")
+    st.subheader("⬇️ Download")
+    out_json = json.dumps(results, ensure_ascii=False, indent=2)
+    st.download_button(
+        "Download results as JSON",
+        data=out_json.encode("utf-8"),
+        file_name="twitter_polls_generated.json",
+        mime="application/json",
+    )
+
+    # Add a button to clear results and start over
+    if st.button("Clear Results & Start Over"):
+        st.session_state.generated_polls = []
+        st.session_state.articles_data = []
+        st.rerun()
 
 st.markdown("---")
 st.caption(
