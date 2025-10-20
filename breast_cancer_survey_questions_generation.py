@@ -883,6 +883,9 @@ if run_btn and articles:
                         if not polls:
                             st.info("No unique polls were generated for this article.")
                         else:
+                            # Collect selected answers for this article
+                            selected_answers = {}
+                            
                             for i, poll in enumerate(polls, start=1):
                                 lines = [ln for ln in poll.splitlines() if ln.strip()]
                                 if not lines:
@@ -891,7 +894,20 @@ if run_btn and articles:
                                 opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
                                 with st.container():
                                     st.markdown(f"**Q{i}. {q}**")
-                                    st.radio(label=" ", options=opts or ["(no options)"], index=None, key=f"{idx}-{i}", disabled=True)
+                                    # ENABLED: Users can now select answers
+                                    answer_key = f"{idx}-{i}"
+                                    selected_answer = st.radio(
+                                        label=" ", 
+                                        options=opts or ["(no options)"], 
+                                        index=None, 
+                                        key=answer_key
+                                    )
+                                    # Store the selected answer
+                                    selected_answers[f"poll_{i}"] = {
+                                        "question": q,
+                                        "selected_answer": selected_answer if selected_answer else "Not answered",
+                                        "options": opts
+                                    }
                                 st.markdown("")
 
                         st.markdown("---")
@@ -901,6 +917,7 @@ if run_btn and articles:
                         "headline": headline,
                         "url": url,
                         "polls": polls,
+                        "selected_answers": selected_answers,  # Store user selections
                         "comment": st.session_state.get(comment_key, ""),
                         "companies": companies_in,
                         "drugs": drugs_in,
@@ -958,6 +975,9 @@ if run_btn and articles:
                         if not polls:
                             st.info("No unique polls were generated for this article.")
                         else:
+                            # Collect selected answers for this article
+                            selected_answers = {}
+                            
                             for i, poll in enumerate(polls, start=1):
                                 lines = [ln for ln in poll.splitlines() if ln.strip()]
                                 if not lines:
@@ -966,7 +986,20 @@ if run_btn and articles:
                                 opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
                                 with st.container():
                                     st.markdown(f"**Q{i}. {q}**")
-                                    st.radio(label=" ", options=opts or ["(no options)"], index=None, key=f"{idx}-{i}", disabled=True)
+                                    # ENABLED: Users can now select answers
+                                    answer_key = f"{idx}-{i}"
+                                    selected_answer = st.radio(
+                                        label=" ", 
+                                        options=opts or ["(no options)"], 
+                                        index=None, 
+                                        key=answer_key
+                                    )
+                                    # Store the selected answer
+                                    selected_answers[f"poll_{i}"] = {
+                                        "question": q,
+                                        "selected_answer": selected_answer if selected_answer else "Not answered",
+                                        "options": opts
+                                    }
                                 st.markdown("")
                         st.markdown("---")
                         st.text_area("Optional HCP comment (will be exported)", key=comment_key, height=100)
@@ -975,6 +1008,7 @@ if run_btn and articles:
                         "headline": headline,
                         "url": url,
                         "polls": polls,
+                        "selected_answers": selected_answers,  # Store user selections
                         "comment": st.session_state.get(comment_key, ""),
                         "companies": companies_in,
                         "drugs": drugs_in,
