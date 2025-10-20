@@ -3,7 +3,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 import numpy as np
@@ -106,7 +106,7 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.caption("Input defaults to `article_summaries_extractions.json` (headline/url/summary_tweet/companies/drugs).")
+    st.caption("Input supports both legacy schema and the new schema with `entities` and `published_date`.")
 
     # --- Grounding validation controls ---
     st.markdown("---")
@@ -276,7 +276,7 @@ def dedup_semantic(blocks: List[str], threshold: float, embedder) -> List[str]:
     return keep
 
 # =========================
-# ENTITY/FACT EXTRACTION (uses provided companies/drugs if present)
+# ENTITY/FACT EXTRACTION
 # =========================
 KNOWN_PHARMA = {
     "Genentech","Roche","Novartis","Pfizer","AstraZeneca","Eli Lilly","Merck",
@@ -353,9 +353,11 @@ def extract_facts_from_inputs(
     url: str,
     companies_in: List[str],
     drugs_in: List[str],
+    indications_in: List[str],
+    trial_phases_in: List[str]
 ) -> Dict:
     """
-    Build a facts dict that uses provided companies/drugs when present,
+    Build a facts dict that uses provided companies/drugs/indications/phases when present,
     and still parses indication/phase/topics from the headline/content text.
     """
     text = f"{headline or ''}\n{content_or_summary or ''}"
@@ -370,8 +372,9 @@ def extract_facts_from_inputs(
     # Choose a single primary drug for awareness (keep full list too)
     drug_primary = (drugs_in[0] if drugs_in else None)
 
-    indication = pick_indication(text_norm)
-    phase = pick_phase(t)
+    # Prefer incoming indication/phase if supplied via entities
+    indication = (indications_in[0] if indications_in else None) or pick_indication(text_norm)
+    phase = (trial_phases_in[0].upper() if trial_phases_in else None) or pick_phase(t)
     topics = detect_topics(text_norm, t)
     return dict(
         companies=companies,
@@ -401,7 +404,7 @@ def build_awareness_poll(facts: Dict) -> str:
     return poll
 
 # =========================
-# LLM MINER
+# LLM MINER (unchanged core)
 # =========================
 class PollMiner:
     def __init__(self, _model_name: str, provider: str, use_hf_inference: bool,
@@ -682,7 +685,7 @@ Q: <HCP-perspective question that strictly reflects article content>
         return self._select_diverse_top4(valid, embedder)
 
 # =========================
-# RULE-BASED FALLBACK (kept simple)
+# RULE-BASED FALLBACK (unchanged)
 # =========================
 def rule_based_polls(facts: Dict) -> List[str]:
     polls: List[str] = []
@@ -716,13 +719,9 @@ def rule_based_polls(facts: Dict) -> List[str]:
     return polls[:MAX_POLLS_PER_ARTICLE]
 
 # =========================
-# GROUNDING VALIDATION HELPERS (NEW)
+# GROUNDING VALIDATION HELPERS
 # =========================
 def _chunk_text_for_similarity(text: str, chunk_size: int = 480, overlap: int = 120) -> List[str]:
-    """
-    Split long grounding text into overlapping chunks so we can measure
-    max similarity of Q against any chunk (prevents length dilution).
-    """
     text = re.sub(r"\s+", " ", text).strip()
     if len(text) <= chunk_size:
         return [text] if text else []
@@ -740,7 +739,6 @@ def _normalize(txt: str) -> str:
     return re.sub(r"\s+", " ", (txt or "").strip().lower())
 
 def _contains_phrase(q: str, phrase: str) -> bool:
-    """Case-insensitive substring check with basic normalization."""
     qn = _normalize(q)
     pn = _normalize(phrase)
     return pn and pn in qn
@@ -755,13 +753,6 @@ def _phase_normalize(p: Optional[str]) -> Optional[str]:
     return p if p else None
 
 def _entity_overlap_score(question_text: str, facts: Dict) -> float:
-    """
-    Weighted presence of key entities in the QUESTION (not options):
-      - drug (0.5)
-      - indication (0.3)
-      - phase (0.2)
-    We only divide by the weights of entities that actually exist in the article facts.
-    """
     q = _normalize(question_text)
 
     w_drug, w_ind, w_ph = 0.5, 0.3, 0.2
@@ -804,14 +795,10 @@ def _entity_overlap_score(question_text: str, facts: Dict) -> float:
             score += w_ph
 
     if total_w == 0.0:
-        # No entities available to check → neutral mid score
         return 0.5
     return score / total_w
 
 def grounding_semantic_similarity(question_text: str, grounding_text: str, embedder) -> float:
-    """
-    Semantic: max cosine between QUESTION and any chunk of the grounding text.
-    """
     q = question_text.strip()
     if not q or not grounding_text:
         return 0.0
@@ -824,28 +811,62 @@ def grounding_semantic_similarity(question_text: str, grounding_text: str, embed
     return float(np.max(sims))
 
 def grounding_overall_score(question_text: str, grounding_text: str, facts: Dict, embedder, entity_weight: float) -> Dict[str, float]:
-    """
-    Overall = (1 - entity_weight) * semantic + entity_weight * entity_overlap
-    Returns dict with components for display + JSON export.
-    """
     sem = grounding_semantic_similarity(question_text, grounding_text, embedder)  # 0..1
     ent = _entity_overlap_score(question_text, facts)                              # 0..1
     overall = (1.0 - float(entity_weight)) * sem + float(entity_weight) * ent
     return {"semantic": sem, "entity": ent, "overall": overall}
 
 # =========================
-# PIPELINE (one article)
+# PIPELINE (schema-aware)
 # =========================
-def extract_facts_from_article(art: Dict):
-    # Input may contain: headline, url, content?, summary_tweet?, companies?, drugs?
-    headline = (art.get("headline") or "").strip()
-    url = (art.get("url") or "").strip()
-    content = (art.get("content") or "").strip()
-    summary_tweet = (art.get("summary_tweet") or "").strip()
-    companies_in = art.get("companies") or []
-    drugs_in = art.get("drugs") or []
+def _coerce_list(x) -> List[str]:
+    if not x:
+        return []
+    if isinstance(x, list):
+        return [str(i).strip() for i in x if str(i).strip()]
+    return [str(x).strip()]
 
-    grounding_text = content if content else (headline + "\n\n" + summary_tweet)
+def _adapt_article_schema(art: Dict) -> Tuple[str, str, str, str, List[str], List[str], str, List[str], List[str]]:
+    """
+    Returns:
+      headline, url, content, summary, companies, drugs, published_date, trial_names, trial_phases/indications
+    Note: trial_phases and indications are returned separately via another function to keep signature tidy.
+    """
+    # Core fields (fallbacks cover legacy + new)
+    headline = (art.get("headline") or art.get("title") or "").strip()
+    url = (art.get("url") or "").strip()
+    content = (art.get("content") or art.get("article") or "").strip()
+    summary = (art.get("summary_280") or art.get("summary_tweet") or art.get("summary") or "").strip()
+    published_date = (art.get("published_date") or art.get("date") or "").strip()
+
+    # Legacy company/drug
+    companies = _coerce_list(art.get("companies"))
+    drugs = _coerce_list(art.get("drugs"))
+
+    # New entities block
+    entities = art.get("entities") or {}
+    # company_name could be a single string
+    ent_company = entities.get("company_name")
+    if ent_company:
+        companies = _coerce_list(ent_company) + [c for c in companies if c not in _coerce_list(ent_company)]
+    # drug_names is a list
+    ent_drugs = _coerce_list(entities.get("drug_names"))
+    if ent_drugs:
+        # prefer entity drugs first
+        drugs = ent_drugs + [d for d in drugs if d not in ent_drugs]
+
+    trial_names = _coerce_list(entities.get("trial_names"))
+    trial_phases = _coerce_list(entities.get("trial_phases"))
+    indications_list = _coerce_list(entities.get("indications"))
+
+    return headline, url, content, summary, companies, drugs, published_date, trial_names, trial_phases, indications_list
+
+def extract_facts_from_article(art: Dict):
+    # Map both schemas into a unified shape
+    (headline, url, content, summary, companies_in, drugs_in,
+     published_date, trial_names, trial_phases, indications_list) = _adapt_article_schema(art)
+
+    grounding_text = content if content else (headline + "\n\n" + summary)
 
     facts = extract_facts_from_inputs(
         headline=headline,
@@ -853,11 +874,33 @@ def extract_facts_from_article(art: Dict):
         url=url,
         companies_in=companies_in,
         drugs_in=drugs_in,
+        indications_in=indications_list,
+        trial_phases_in=trial_phases,
     )
-    return headline, url, grounding_text, summary_tweet, companies_in, drugs_in, facts
+    # Return everything needed downstream
+    return {
+        "headline": headline,
+        "url": url,
+        "grounding_text": grounding_text,
+        "summary": summary,
+        "companies_in": companies_in,
+        "drugs_in": drugs_in,
+        "facts": facts,
+        "published_date": published_date,
+        "trial_names": trial_names,
+        "trial_phases": trial_phases,
+        "indications_list": indications_list,
+    }
 
 def build_polls_for_article(art: Dict):
-    headline, url, grounding_text, summary_tweet, companies_in, drugs_in, facts = extract_facts_from_article(art)
+    data = extract_facts_from_article(art)
+    headline = data["headline"]
+    url = data["url"]
+    grounding_text = data["grounding_text"]
+    summary = data["summary"]
+    companies_in = data["companies_in"]
+    drugs_in = data["drugs_in"]
+    facts = data["facts"]
 
     awareness = build_awareness_poll(facts)
 
@@ -900,7 +943,7 @@ def build_polls_for_article(art: Dict):
         if util.cos_sim(embedder.encode(stem), embedder.encode(stems)).max().item() < 0.90:
             final.append(p); stems.append(stem)
 
-    # === NEW: compute grounding scores for each final poll (question line only) ===
+    # === grounding scores for each final poll (question line only) ===
     poll_scores: List[Dict] = []
     for poll in final:
         lines = [ln for ln in poll.splitlines() if ln.strip()]
@@ -909,7 +952,15 @@ def build_polls_for_article(art: Dict):
         scores = grounding_overall_score(question_text, grounding_text, facts, embedder, entity_weight)
         poll_scores.append(scores)
 
-    return final, poll_scores, facts, grounding_text, summary_tweet, companies_in, drugs_in, headline, url
+    # Bubble up additional new-schema fields to caller
+    extra = {
+        "published_date": data["published_date"],
+        "trial_names": data["trial_names"],
+        "trial_phases": data["trial_phases"],
+        "indications_list": data["indications_list"],
+    }
+
+    return final, poll_scores, facts, grounding_text, summary, companies_in, drugs_in, headline, url, extra
 
 # =========================
 # FILE INPUTS
@@ -950,7 +1001,6 @@ if run_btn:
             else:
                 articles = load_json_any(p)
         else:
-            # Default now prefers article_summaries_extractions.json
             guesses = [
                 APP_DIR / "article_summaries_extractions.json",
                 APP_DIR / "twitter_polls_generated_v3.json",
@@ -986,33 +1036,51 @@ if run_btn and articles:
             with st.spinner("Generating polls…"):
                 for idx, art in enumerate(articles, start=1):
                     try:
-                        polls, poll_scores, facts, grounding_text, summary_tweet, companies_in, drugs_in, headline, url = build_polls_for_article(art)
+                        polls, poll_scores, facts, grounding_text, summary, companies_in, drugs_in, headline, url, extra = build_polls_for_article(art)
                     except Exception as e:
-                        headline = (art.get("headline") or "").strip()
+                        headline = (art.get("headline") or art.get("title") or "").strip()
                         st.error(f"#{idx} {headline or '(no headline)'}: {e}")
                         continue
+
+                    published_date = extra.get("published_date") or ""
+                    trial_names = extra.get("trial_names") or []
+                    trial_phases = extra.get("trial_phases") or []
+                    indications_list = extra.get("indications_list") or []
 
                     comment_key = f"comment-{idx}"
                     st.session_state.setdefault(comment_key, "")
                     with st.expander(f"#{idx}  {headline or '(no headline)'}", expanded=False):
+                        # Source + Published
+                        src_line = []
                         if url:
-                            st.markdown(f"**Source:** [{url}]({url})")
+                            src_line.append(f"**Source:** [{url}]({url})")
+                        if published_date:
+                            src_line.append(f"**Published:** {published_date}")
+                        if src_line:
+                            st.markdown(" &nbsp; • &nbsp; ".join(src_line))
 
-                        col1, col2, col3 = st.columns([1.2, 1, 1])
+                        col1, col2, col3 = st.columns([1.4, 1.2, 1.2])
                         with col1:
                             st.markdown("**Drugs/Products:** " + (", ".join(drugs_in) if drugs_in else (facts.get("drug") or "—")))
-                            st.markdown("**Indication:** " + (facts.get("indication") or "—"))
-                            st.markdown("**Phase:** " + (facts.get("phase") or "—"))
+                            st.markdown("**Indication (primary):** " + (facts.get("indication") or "—"))
+                            if indications_list:
+                                st.caption("Other indications: " + ", ".join(indications_list))
                         with col2:
-                            st.markdown("**Publisher:** " + (facts.get("publisher") or "—"))
-                            st.markdown("**Companies:** " + (", ".join(companies_in) if companies_in else (", ".join(facts.get("companies", [])) or "—")))
+                            st.markdown("**Publisher (from URL):** " + (facts.get("publisher") or "—"))
+                            st.markdown("**Company:** " + (", ".join(companies_in) if companies_in else (", ".join(facts.get("companies", [])) or "—")))
+                            st.markdown("**Phase (primary):** " + (facts.get("phase") or "—"))
+                            if trial_phases:
+                                st.caption("Trial phases: " + ", ".join(trial_phases))
                         with col3:
                             ts = [k for k, v in facts.get("topics", {}).items() if v]
                             st.markdown("**Topics:** " + (", ".join(ts) if ts else "—"))
+                            if trial_names:
+                                st.markdown("**Trials:** " + ", ".join(trial_names))
 
-                        if summary_tweet:
-                            st.markdown("**Summary (tweet):**")
-                            st.markdown("> " + summary_tweet.replace("\n", " "))
+                        # Summary / Content preview
+                        if summary:
+                            st.markdown("**Summary:**")
+                            st.markdown("> " + summary.replace("\n", " "))
                         elif grounding_text:
                             preview = grounding_text.strip()
                             if len(preview) > 600:
@@ -1034,7 +1102,7 @@ if run_btn and articles:
                                 q = lines[0].replace("Q:", "").strip()
                                 opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
 
-                                # --- NEW: display grounding scores & flag ---
+                                # grounding scores & flag
                                 sc = poll_scores[i-1] if i-1 < len(poll_scores) else {"semantic": 0.0, "entity": 0.0, "overall": 0.0}
                                 needs_review = sc["overall"] < grounding_threshold
                                 badge = f"Score: **{sc['overall']:.2f}**  (semantic {sc['semantic']:.2f} · entity {sc['entity']:.2f})"
@@ -1055,7 +1123,7 @@ if run_btn and articles:
                                         "options": opts,
                                         "grounding_score": {
                                             "overall": round(sc["overall"], 4),
-                                            "semantic": round(sc["semantic"], 4),
+                                            "semantic": round(sc["semantic"] ,4),
                                             "entity": round(sc["entity"], 4),
                                             "threshold": grounding_threshold,
                                             "needs_review": needs_review,
@@ -1066,15 +1134,22 @@ if run_btn and articles:
                         st.markdown("---")
                         st.text_area("Optional HCP comment (will be exported)", key=comment_key, height=100)
 
+                    # Save result with the new fields included
                     results.append({
                         "headline": headline,
                         "url": url,
+                        "published_date": published_date,
                         "polls": polls,
-                        "selected_answers": selected_answers,  # Store user selections + scores
+                        "selected_answers": selected_answers,
                         "comment": st.session_state.get(comment_key, ""),
                         "companies": companies_in,
                         "drugs": drugs_in,
-                        "summary_tweet": summary_tweet,
+                        "summary": summary,
+                        "entities": {
+                            "trial_names": trial_names,
+                            "trial_phases": trial_phases,
+                            "indications": indications_list
+                        }
                     })
 
             st.markdown("---")
@@ -1092,31 +1167,49 @@ if run_btn and articles:
             with st.spinner("Generating polls…"):
                 for idx, art in enumerate(articles, start=1):
                     try:
-                        polls, poll_scores, facts, grounding_text, summary_tweet, companies_in, drugs_in, headline, url = build_polls_for_article(art)
+                        polls, poll_scores, facts, grounding_text, summary, companies_in, drugs_in, headline, url, extra = build_polls_for_article(art)
                     except Exception as e:
-                        headline = (art.get("headline") or "").strip()
+                        headline = (art.get("headline") or art.get("title") or "").strip()
                         st.error(f"#{idx} {headline or '(no headline)'}: {e}")
                         continue
+
+                    published_date = extra.get("published_date") or ""
+                    trial_names = extra.get("trial_names") or []
+                    trial_phases = extra.get("trial_phases") or []
+                    indications_list = extra.get("indications_list") or []
 
                     comment_key = f"comment-{idx}"
                     st.session_state.setdefault(comment_key, "")
                     with st.expander(f"#{idx}  {headline or '(no headline)'}", expanded=False):
+                        src_line = []
                         if url:
-                            st.markdown(f"**Source:** [{url}]({url})")
-                        col1, col2, col3 = st.columns([1.2, 1, 1])
+                            src_line.append(f"**Source:** [{url}]({url})")
+                        if published_date:
+                            src_line.append(f"**Published:** {published_date}")
+                        if src_line:
+                            st.markdown(" &nbsp; • &nbsp; ".join(src_line))
+
+                        col1, col2, col3 = st.columns([1.4, 1.2, 1.2])
                         with col1:
                             st.markdown("**Drugs/Products:** " + (", ".join(drugs_in) if drugs_in else (facts.get("drug") or "—")))
-                            st.markdown("**Indication:** " + (facts.get("indication") or "—"))
-                            st.markdown("**Phase:** " + (facts.get("phase") or "—"))
+                            st.markdown("**Indication (primary):** " + (facts.get("indication") or "—"))
+                            if indications_list:
+                                st.caption("Other indications: " + ", ".join(indications_list))
                         with col2:
-                            st.markdown("**Publisher:** " + (facts.get("publisher") or "—"))
-                            st.markdown("**Companies:** " + (", ".join(companies_in) if companies_in else (", ".join(facts.get("companies", [])) or "—")))
+                            st.markdown("**Publisher (from URL):** " + (facts.get("publisher") or "—"))
+                            st.markdown("**Company:** " + (", ".join(companies_in) if companies_in else (", ".join(facts.get("companies", [])) or "—")))
+                            st.markdown("**Phase (primary):** " + (facts.get("phase") or "—"))
+                            if trial_phases:
+                                st.caption("Trial phases: " + ", ".join(trial_phases))
                         with col3:
                             ts = [k for k, v in facts.get("topics", {}).items() if v]
                             st.markdown("**Topics:** " + (", ".join(ts) if ts else "—"))
-                        if summary_tweet:
-                            st.markdown("**Summary (tweet):**")
-                            st.markdown("> " + summary_tweet.replace("\n", " "))
+                            if trial_names:
+                                st.markdown("**Trials:** " + ", ".join(trial_names))
+
+                        if summary:
+                            st.markdown("**Summary:**")
+                            st.markdown("> " + summary.replace("\n", " "))
                         elif grounding_text:
                             preview = grounding_text.strip()
                             if len(preview) > 600:
@@ -1129,7 +1222,6 @@ if run_btn and articles:
                             st.info("No unique polls were generated for this article.")
                             selected_answers = {}
                         else:
-                            # Collect selected answers for this article
                             selected_answers = {}
                             for i, poll in enumerate(polls, start=1):
                                 lines = [ln for ln in poll.splitlines() if ln.strip()]
@@ -1138,7 +1230,6 @@ if run_btn and articles:
                                 q = lines[0].replace("Q:", "").strip()
                                 opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
 
-                                # --- NEW: display grounding scores & flag ---
                                 sc = poll_scores[i-1] if i-1 < len(poll_scores) else {"semantic": 0.0, "entity": 0.0, "overall": 0.0}
                                 needs_review = sc["overall"] < grounding_threshold
                                 badge = f"Score: **{sc['overall']:.2f}**  (semantic {sc['semantic']:.2f} · entity {sc['entity']:.2f})"
@@ -1159,7 +1250,7 @@ if run_btn and articles:
                                         "options": opts,
                                         "grounding_score": {
                                             "overall": round(sc["overall"], 4),
-                                            "semantic": round(sc["semantic"], 4),
+                                            "semantic": round(sc["semantic"] ,4),
                                             "entity": round(sc["entity"], 4),
                                             "threshold": grounding_threshold,
                                             "needs_review": needs_review,
@@ -1172,12 +1263,18 @@ if run_btn and articles:
                     results.append({
                         "headline": headline,
                         "url": url,
+                        "published_date": published_date,
                         "polls": polls,
-                        "selected_answers": selected_answers,  # Store user selections + scores
+                        "selected_answers": selected_answers,
                         "comment": st.session_state.get(comment_key, ""),
                         "companies": companies_in,
                         "drugs": drugs_in,
-                        "summary_tweet": summary_tweet,
+                        "summary": summary,
+                        "entities": {
+                            "trial_names": trial_names,
+                            "trial_phases": trial_phases,
+                            "indications": indications_list
+                        }
                     })
 
             st.markdown("---")
@@ -1192,7 +1289,6 @@ if run_btn and articles:
 
 st.markdown("---")
 st.caption(
-    "Using server-side credentials via Streamlit secrets/env. "
-    "If polls look truncated, raise 'Max new tokens per pass'. "
-    "Default input: article_summaries_extractions.json."
+    "Now supports new input schema: published_date + entities (drug_names, company_name, trial_names, trial_phases, indications). "
+    "If polls look truncated, raise 'Max new tokens per pass'."
 )
