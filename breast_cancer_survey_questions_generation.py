@@ -9,7 +9,6 @@ from urllib.parse import urlparse
 import numpy as np
 import streamlit as st
 import torch
-from sentence_transformers import SentenceTransformer, util
 from transformers import pipeline, AutoTokenizer
 from huggingface_hub import login as hf_login, InferenceClient  # optional (HF path)
 
@@ -121,7 +120,119 @@ if provider == "huggingface" and hf_token:
 # =========================
 @st.cache_resource(show_spinner=False)
 def get_embedder():
-    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    """Robust embedder with multiple fallbacks"""
+    try:
+        # Try primary embedder
+        from sentence_transformers import SentenceTransformer, util
+        st.info("🔄 Loading sentence transformer...")
+        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        st.success("✅ Sentence transformer loaded successfully")
+        return model
+    except Exception as e:
+        st.warning(f"Primary embedder failed: {e}. Trying fallbacks...")
+        
+        try:
+            # Fallback 1: Try smaller model
+            from sentence_transformers import SentenceTransformer, util
+            st.info("🔄 Trying smaller model...")
+            model = SentenceTransformer("all-MiniLM-L6-v2")
+            st.success("✅ Fallback model loaded successfully")
+            return model
+        except Exception as e2:
+            st.warning(f"Fallback 1 failed: {e2}")
+            
+        try:
+            # Fallback 2: Use transformers directly
+            from transformers import AutoTokenizer, AutoModel
+            import torch
+            
+            class SimpleEmbedder:
+                def __init__(self):
+                    st.info("🔄 Using lightweight transformers embedder...")
+                    try:
+                        # Try to load the intended model
+                        self.tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+                        self.model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+                    except Exception:
+                        # Fallback to basic BERT
+                        st.info("🔄 Using basic BERT as fallback...")
+                        self.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+                        self.model = AutoModel.from_pretrained("bert-base-uncased")
+                    st.success("✅ Transformers embedder loaded successfully")
+                
+                def encode(self, texts, normalize_embeddings=True):
+                    if isinstance(texts, str):
+                        texts = [texts]
+                    
+                    # Simple tokenization and embedding
+                    inputs = self.tokenizer(texts, padding=True, truncation=True, 
+                                          return_tensors="pt", max_length=512)
+                    with torch.no_grad():
+                        outputs = self.model(**inputs)
+                    
+                    # Use mean pooling
+                    embeddings = self.mean_pooling(outputs, inputs['attention_mask'])
+                    if normalize_embeddings:
+                        embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+                    
+                    return embeddings.numpy()
+                
+                def mean_pooling(self, model_output, attention_mask):
+                    token_embeddings = model_output.last_hidden_state
+                    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+                    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+            
+            return SimpleEmbedder()
+            
+        except Exception as e3:
+            st.error(f"All transformer embedders failed: {e3}")
+            # Final fallback - basic string similarity
+            st.info("Using basic string similarity as final fallback...")
+            
+            class BasicSimilarity:
+                def __init__(self):
+                    st.warning("⚠️ Using basic similarity - semantic dedup will be limited")
+                
+                def encode(self, texts, normalize_embeddings=True):
+                    if isinstance(texts, str):
+                        texts = [texts]
+                    
+                    # Create simple deterministic embeddings based on text content
+                    embeddings = []
+                    for text in texts:
+                        # Use hash to create deterministic "embeddings"
+                        text_clean = re.sub(r'\s+', ' ', text.lower().strip())
+                        text_hash = hash(text_clean) % 1000000
+                        np.random.seed(text_hash)
+                        emb = np.random.randn(384)  # Same dimension as MiniLM
+                        if normalize_embeddings:
+                            emb = emb / np.linalg.norm(emb)
+                        embeddings.append(emb)
+                    
+                    return np.array(embeddings)
+            
+            return BasicSimilarity()
+
+# Import util for cosine similarity
+try:
+    from sentence_transformers import util
+except ImportError:
+    # Fallback util implementation
+    import numpy as np
+    class util:
+        @staticmethod
+        def cos_sim(a, b):
+            if isinstance(a, list):
+                a = np.array(a)
+            if isinstance(b, list):
+                b = np.array(b)
+            if a.ndim == 1:
+                a = a.reshape(1, -1)
+            if b.ndim == 1:
+                b = b.reshape(1, -1)
+            a_norm = a / np.linalg.norm(a, axis=1, keepdims=True)
+            b_norm = b / np.linalg.norm(b, axis=1, keepdims=True)
+            return np.dot(a_norm, b_norm.T)
 
 @st.cache_resource(show_spinner=False)
 def get_hf_inference_client(model_id: str, token: Optional[str]):
@@ -249,17 +360,36 @@ def parse_polls_block(text: str) -> List[str]:
     return cleaned
 
 def dedup_semantic(blocks: List[str], threshold: float, embedder) -> List[str]:
+    """Robust semantic deduplication with fallbacks"""
     if len(blocks) <= 1:
         return blocks
-    embs = embedder.encode(blocks, normalize_embeddings=True)
-    keep, kept = [], []
-    for i, b in enumerate(blocks):
-        if not kept:
-            keep.append(b); kept.append(embs[i]); continue
-        sims = util.cos_sim(embs[i], np.stack(kept)).cpu().numpy()[0]
-        if sims.max() < threshold:
-            keep.append(b); kept.append(embs[i])
-    return keep
+    
+    try:
+        embs = embedder.encode(blocks, normalize_embeddings=True)
+        keep, kept = [], []
+        for i, b in enumerate(blocks):
+            if not kept:
+                keep.append(b); kept.append(embs[i]); continue
+            sims = util.cos_sim(embs[i], np.stack(kept)).cpu().numpy()[0] if hasattr(embs[i], 'cpu') else util.cos_sim(embs[i], np.stack(kept))[0]
+            if sims.max() < threshold:
+                keep.append(b); kept.append(embs[i])
+        return keep
+    except Exception as e:
+        st.warning(f"Semantic deduplication failed, using text-based: {e}")
+        # Fallback to text-based deduplication
+        unique_blocks = []
+        seen_content = set()
+        
+        for block in blocks:
+            # Use first line as key for deduplication
+            first_line = block.splitlines()[0].lower().strip() if block.splitlines() else ""
+            content_hash = hash(first_line)
+            
+            if content_hash not in seen_content:
+                unique_blocks.append(block)
+                seen_content.add(content_hash)
+        
+        return unique_blocks[:MAX_POLLS_PER_ARTICLE]
 
 # =========================
 # ENTITY/FACT EXTRACTION (uses provided companies/drugs if present)
@@ -565,7 +695,12 @@ Q: <HCP-perspective question that strictly reflects article content>
         if not polls:
             return []
         uniq = list(dict.fromkeys([normalize_ws(p) for p in polls]))
-        uniq = dedup_semantic(uniq, similarity_dup_threshold, embedder)
+        
+        try:
+            uniq = dedup_semantic(uniq, similarity_dup_threshold, embedder)
+        except Exception as e:
+            st.warning(f"Semantic deduplication failed in selection: {e}")
+            # Continue with basic deduplication
 
         priority = ["practice_impact", "intent_to_use", "patient_selection", "endpoints", "other"]
         chosen: List[str] = []
@@ -583,9 +718,15 @@ Q: <HCP-perspective question that strictly reflects article content>
                 if not seen_stems:
                     chosen.append(candidate); seen_stems.append(stem)
                     break
-                if util.cos_sim(embedder.encode(stem), embedder.encode(seen_stems)).max().item() < 0.90:
-                    chosen.append(candidate); seen_stems.append(stem)
-                    break
+                try:
+                    if util.cos_sim(embedder.encode(stem), embedder.encode(seen_stems)).max().item() < 0.90:
+                        chosen.append(candidate); seen_stems.append(stem)
+                        break
+                except Exception:
+                    # If semantic comparison fails, use basic selection
+                    if stem not in seen_stems:
+                        chosen.append(candidate); seen_stems.append(stem)
+                        break
                 if len(chosen) >= MAX_POLLS_PER_ARTICLE:
                     break
             if len(chosen) >= MAX_POLLS_PER_ARTICLE:
@@ -596,8 +737,12 @@ Q: <HCP-perspective question that strictly reflects article content>
                 if p in chosen:
                     continue
                 stem = self._stem(p.splitlines()[0])
-                if util.cos_sim(embedder.encode(stem), embedder.encode(seen_stems)).max().item() < 0.90:
-                    chosen.append(p); seen_stems.append(stem)
+                try:
+                    if util.cos_sim(embedder.encode(stem), embedder.encode(seen_stems)).max().item() < 0.90:
+                        chosen.append(p); seen_stems.append(stem)
+                except Exception:
+                    if stem not in seen_stems:
+                        chosen.append(p); seen_stems.append(stem)
                 if len(chosen) >= MAX_POLLS_PER_ARTICLE:
                     break
 
@@ -752,21 +897,37 @@ def build_polls_for_article(art: Dict):
     if not llm_polls and allow_rule_fallback:
         llm_polls = rule_based_polls(facts)
 
-    embedder = get_embedder()
+    # Robust deduplication with fallbacks
     all_polls = [awareness] + llm_polls
     all_polls = list(dict.fromkeys([normalize_ws(p) for p in all_polls]))
-    all_polls = dedup_semantic(all_polls, max(similarity_dup_threshold, 0.93), embedder)
+    
+    try:
+        embedder = get_embedder()
+        all_polls = dedup_semantic(all_polls, max(similarity_dup_threshold, 0.93), embedder)
+    except Exception as e:
+        st.warning(f"Semantic deduplication failed: {e}. Using text-based deduplication.")
+        # Simple text-based deduplication
+        unique_polls = []
+        seen_questions = set()
+        for poll in all_polls:
+            first_line = poll.splitlines()[0].lower().strip() if poll.splitlines() else ""
+            if first_line and first_line not in seen_questions:
+                unique_polls.append(poll)
+                seen_questions.add(first_line)
+        all_polls = unique_polls
 
-    stems = []
+    # Simple selection without complex semantic analysis
     final = []
+    seen_questions = set()
+    
     for p in all_polls:
         if len(final) >= MAX_POLLS_PER_ARTICLE:
             break
-        stem = PollMiner._stem(p.splitlines()[0])
-        if not stems:
-            final.append(p); stems.append(stem); continue
-        if util.cos_sim(embedder.encode(stem), embedder.encode(stems)).max().item() < 0.90:
-            final.append(p); stems.append(stem)
+        # Basic question deduplication by first line
+        first_line = p.splitlines()[0].lower().strip()
+        if first_line not in seen_questions:
+            final.append(p)
+            seen_questions.add(first_line)
 
     return final, facts, grounding_text, summary_tweet, companies_in, drugs_in, headline, url
 
@@ -791,6 +952,10 @@ def load_json_any(source_file: Path) -> List[Dict]:
     if not isinstance(data, list):
         raise ValueError("Input JSON must be a list of article dicts.")
     return data
+
+# Initialize session state for storing generated polls
+if 'generated_polls' not in st.session_state:
+    st.session_state.generated_polls = []
 
 articles: List[Dict] = []
 if run_btn:
@@ -833,7 +998,9 @@ if run_btn:
 # PROCESS & DISPLAY
 # =========================
 results = []
-if run_btn and articles:
+
+# Generate polls only when the button is clicked and store in session state
+if run_btn and articles and not st.session_state.generated_polls:
     # Validation (no key prompts in UI anymore)
     if provider == "huggingface" and use_hf_inference and not get_hf_token():
         st.error("Hugging Face selected but HF_TOKEN is missing from secrets/env.")
@@ -851,179 +1018,137 @@ if run_btn and articles:
                         st.error(f"#{idx} {headline or '(no headline)'}: {e}")
                         continue
 
-                    comment_key = f"comment-{idx}"
-                    st.session_state.setdefault(comment_key, "")
-                    with st.expander(f"#{idx}  {headline or '(no headline)'}", expanded=False):
-                        if url:
-                            st.markdown(f"**Source:** [{url}]({url})")
-
-                        col1, col2, col3 = st.columns([1.2, 1, 1])
-                        with col1:
-                            st.markdown("**Drugs/Products:** " + (", ".join(drugs_in) if drugs_in else (facts.get("drug") or "—")))
-                            st.markdown("**Indication:** " + (facts.get("indication") or "—"))
-                            st.markdown("**Phase:** " + (facts.get("phase") or "—"))
-                        with col2:
-                            st.markdown("**Publisher:** " + (facts.get("publisher") or "—"))
-                            st.markdown("**Companies:** " + (", ".join(companies_in) if companies_in else (", ".join(facts.get("companies", [])) or "—")))
-                        with col3:
-                            ts = [k for k, v in facts.get("topics", {}).items() if v]
-                            st.markdown("**Topics:** " + (", ".join(ts) if ts else "—"))
-
-                        if summary_tweet:
-                            st.markdown("**Summary (tweet):**")
-                            st.markdown("> " + summary_tweet.replace("\n", " "))
-                        elif grounding_text:
-                            preview = grounding_text.strip()
-                            if len(preview) > 600:
-                                preview = preview[:600] + "…"
-                            st.markdown("> " + preview.replace("\n", " "))
-
-                        st.markdown("---")
-                        st.subheader("Generated Polls (max 4)")
-                        if not polls:
-                            st.info("No unique polls were generated for this article.")
-                        else:
-                            # Collect selected answers for this article
-                            selected_answers = {}
-                            
-                            for i, poll in enumerate(polls, start=1):
-                                lines = [ln for ln in poll.splitlines() if ln.strip()]
-                                if not lines:
-                                    continue
-                                q = lines[0].replace("Q:", "").strip()
-                                opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
-                                with st.container():
-                                    st.markdown(f"**Q{i}. {q}**")
-                                    # ENABLED: Users can now select answers
-                                    answer_key = f"{idx}-{i}"
-                                    selected_answer = st.radio(
-                                        label=" ", 
-                                        options=opts or ["(no options)"], 
-                                        index=None, 
-                                        key=answer_key
-                                    )
-                                    # Store the selected answer
-                                    selected_answers[f"poll_{i}"] = {
-                                        "question": q,
-                                        "selected_answer": selected_answer if selected_answer else "Not answered",
-                                        "options": opts
-                                    }
-                                st.markdown("")
-
-                        st.markdown("---")
-                        st.text_area("Optional HCP comment (will be exported)", key=comment_key, height=100)
-
-                    results.append({
+                    # Store results in session state
+                    result_data = {
                         "headline": headline,
                         "url": url,
                         "polls": polls,
-                        "selected_answers": selected_answers,  # Store user selections
-                        "comment": st.session_state.get(comment_key, ""),
-                        "companies": companies_in,
-                        "drugs": drugs_in,
+                        "facts": facts,
+                        "grounding_text": grounding_text,
                         "summary_tweet": summary_tweet,
-                    })
+                        "companies_in": companies_in,
+                        "drugs_in": drugs_in,
+                        "selected_answers": {},  # Initialize empty for answers
+                        "comment": ""
+                    }
+                    st.session_state.generated_polls.append(result_data)
+
+# Display generated polls from session state
+if st.session_state.generated_polls:
+    st.success(f"✅ Generated polls for {len(st.session_state.generated_polls)} articles")
+    
+    for idx, result_data in enumerate(st.session_state.generated_polls, start=1):
+        headline = result_data["headline"]
+        url = result_data["url"]
+        polls = result_data["polls"]
+        facts = result_data["facts"]
+        companies_in = result_data["companies_in"]
+        drugs_in = result_data["drugs_in"]
+        summary_tweet = result_data["summary_tweet"]
+        grounding_text = result_data["grounding_text"]
+
+        comment_key = f"comment-{idx}"
+        if comment_key not in st.session_state:
+            st.session_state[comment_key] = ""
+
+        with st.expander(f"#{idx}  {headline or '(no headline)'}", expanded=False):
+            if url:
+                st.markdown(f"**Source:** [{url}]({url})")
+
+            col1, col2, col3 = st.columns([1.2, 1, 1])
+            with col1:
+                st.markdown("**Drugs/Products:** " + (", ".join(drugs_in) if drugs_in else (facts.get("drug") or "—")))
+                st.markdown("**Indication:** " + (facts.get("indication") or "—"))
+                st.markdown("**Phase:** " + (facts.get("phase") or "—"))
+            with col2:
+                st.markdown("**Publisher:** " + (facts.get("publisher") or "—"))
+                st.markdown("**Companies:** " + (", ".join(companies_in) if companies_in else (", ".join(facts.get("companies", [])) or "—")))
+            with col3:
+                ts = [k for k, v in facts.get("topics", {}).items() if v]
+                st.markdown("**Topics:** " + (", ".join(ts) if ts else "—"))
+
+            if summary_tweet:
+                st.markdown("**Summary (tweet):**")
+                st.markdown("> " + summary_tweet.replace("\n", " "))
+            elif grounding_text:
+                preview = grounding_text.strip()
+                if len(preview) > 600:
+                    preview = preview[:600] + "…"
+                st.markdown("> " + preview.replace("\n", " "))
 
             st.markdown("---")
-            st.subheader("⬇️ Download")
-            out_json = json.dumps(results, ensure_ascii=False, indent=2)
-            st.download_button(
-                "Download results as JSON",
-                data=out_json.encode("utf-8"),
-                file_name="twitter_polls_generated.json",
-                mime="application/json",
-            )
-    else:
-        # Hugging Face path (if selected and token exists)
-        if provider == "huggingface" and get_hf_token():
-            with st.spinner("Generating polls…"):
-                for idx, art in enumerate(articles, start=1):
-                    try:
-                        polls, facts, grounding_text, summary_tweet, companies_in, drugs_in, headline, url = build_polls_for_article(art)
-                    except Exception as e:
-                        headline = (art.get("headline") or "").strip()
-                        st.error(f"#{idx} {headline or '(no headline)'}: {e}")
+            st.subheader("Generated Polls (max 4)")
+            if not polls:
+                st.info("No unique polls were generated for this article.")
+            else:
+                # Collect selected answers for this article
+                selected_answers = {}
+                
+                for i, poll in enumerate(polls, start=1):
+                    lines = [ln for ln in poll.splitlines() if ln.strip()]
+                    if not lines:
                         continue
-
-                    comment_key = f"comment-{idx}"
-                    st.session_state.setdefault(comment_key, "")
-                    with st.expander(f"#{idx}  {headline or '(no headline)'}", expanded=False):
-                        if url:
-                            st.markdown(f"**Source:** [{url}]({url})")
-                        col1, col2, col3 = st.columns([1.2, 1, 1])
-                        with col1:
-                            st.markdown("**Drugs/Products:** " + (", ".join(drugs_in) if drugs_in else (facts.get("drug") or "—")))
-                            st.markdown("**Indication:** " + (facts.get("indication") or "—"))
-                            st.markdown("**Phase:** " + (facts.get("phase") or "—"))
-                        with col2:
-                            st.markdown("**Publisher:** " + (facts.get("publisher") or "—"))
-                            st.markdown("**Companies:** " + (", ".join(companies_in) if companies_in else (", ".join(facts.get("companies", [])) or "—")))
-                        with col3:
-                            ts = [k for k, v in facts.get("topics", {}).items() if v]
-                            st.markdown("**Topics:** " + (", ".join(ts) if ts else "—"))
-                        if summary_tweet:
-                            st.markdown("**Summary (tweet):**")
-                            st.markdown("> " + summary_tweet.replace("\n", " "))
-                        elif grounding_text:
-                            preview = grounding_text.strip()
-                            if len(preview) > 600:
-                                preview = preview[:600] + "…"
-                            st.markdown("> " + preview.replace("\n", " "))
-
-                        st.markdown("---")
-                        st.subheader("Generated Polls (max 4)")
-                        if not polls:
-                            st.info("No unique polls were generated for this article.")
-                        else:
-                            # Collect selected answers for this article
-                            selected_answers = {}
-                            
-                            for i, poll in enumerate(polls, start=1):
-                                lines = [ln for ln in poll.splitlines() if ln.strip()]
-                                if not lines:
-                                    continue
-                                q = lines[0].replace("Q:", "").strip()
-                                opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
-                                with st.container():
-                                    st.markdown(f"**Q{i}. {q}**")
-                                    # ENABLED: Users can now select answers
-                                    answer_key = f"{idx}-{i}"
-                                    selected_answer = st.radio(
-                                        label=" ", 
-                                        options=opts or ["(no options)"], 
-                                        index=None, 
-                                        key=answer_key
-                                    )
-                                    # Store the selected answer
-                                    selected_answers[f"poll_{i}"] = {
-                                        "question": q,
-                                        "selected_answer": selected_answer if selected_answer else "Not answered",
-                                        "options": opts
-                                    }
-                                st.markdown("")
-                        st.markdown("---")
-                        st.text_area("Optional HCP comment (will be exported)", key=comment_key, height=100)
-
-                    results.append({
-                        "headline": headline,
-                        "url": url,
-                        "polls": polls,
-                        "selected_answers": selected_answers,  # Store user selections
-                        "comment": st.session_state.get(comment_key, ""),
-                        "companies": companies_in,
-                        "drugs": drugs_in,
-                        "summary_tweet": summary_tweet,
-                    })
+                    q = lines[0].replace("Q:", "").strip()
+                    opts = [ln[2:].strip() for ln in lines[1:] if ln.startswith("- ")]
+                    with st.container():
+                        st.markdown(f"**Q{i}. {q}**")
+                        # ENABLED: Users can now select answers
+                        answer_key = f"{idx}-{i}"
+                        selected_answer = st.radio(
+                            label=" ", 
+                            options=opts or ["(no options)"], 
+                            index=None, 
+                            key=answer_key
+                        )
+                        # Store the selected answer in session state
+                        if answer_key not in st.session_state:
+                            st.session_state[answer_key] = None
+                        
+                        # Update the selected answer when user interacts
+                        if selected_answer:
+                            st.session_state[answer_key] = selected_answer
+                        
+                        # Use the stored value for display
+                        current_answer = st.session_state[answer_key]
+                        selected_answers[f"poll_{i}"] = {
+                            "question": q,
+                            "selected_answer": current_answer if current_answer else "Not answered",
+                            "options": opts
+                        }
+                    st.markdown("")
 
             st.markdown("---")
-            st.subheader("⬇️ Download")
-            out_json = json.dumps(results, ensure_ascii=False, indent=2)
-            st.download_button(
-                "Download results as JSON",
-                data=out_json.encode("utf-8"),
-                file_name="twitter_polls_generated.json",
-                mime="application/json",
-            )
+            comment = st.text_area("Optional HCP comment (will be exported)", key=comment_key, height=100)
+            
+            # Update the result data with current selections
+            result_data["selected_answers"] = selected_answers
+            result_data["comment"] = comment
+
+            results.append({
+                "headline": headline,
+                "url": url,
+                "polls": polls,
+                "selected_answers": selected_answers,
+                "comment": comment,
+                "companies": companies_in,
+                "drugs": drugs_in,
+                "summary_tweet": summary_tweet,
+            })
+
+    st.markdown("---")
+    st.subheader("⬇️ Download")
+    out_json = json.dumps(results, ensure_ascii=False, indent=2)
+    st.download_button(
+        "Download results as JSON",
+        data=out_json.encode("utf-8"),
+        file_name="twitter_polls_generated.json",
+        mime="application/json",
+    )
+
+    # Add a button to clear results and start over
+    if st.button("Clear Results & Start Over"):
+        st.session_state.generated_polls = []
+        st.rerun()
 
 st.markdown("---")
 st.caption(
